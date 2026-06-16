@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 import collectors as signal_engine
 
 APP_NAME = "NEXUS Deal Intelligence Engine"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -896,6 +896,346 @@ def dismiss_signal(signal_id: str, db: Session = Depends(get_db)):
 
 
 # ===========================================================================
+# BANK STATEMENT ANALYZER (Phase 2) — the deal-packaging engine
+# ===========================================================================
+
+class BankStatementInput(BaseModel):
+    """Accept either raw text (pasted/extracted) or pre-computed metrics."""
+    deal_id: str = ""
+    # Raw text path: paste bank statement text, Claude structures it
+    raw_text: str = ""
+    # Manual metrics path: enter numbers directly
+    months: list[dict] = Field(default_factory=list)  # [{month, deposits, withdrawals, ending_balance, nsf_count, negative_days}]
+    # If neither raw_text nor months, just re-analyze from deal's existing metrics
+
+
+class MonthMetrics(BaseModel):
+    month: str = ""
+    total_deposits: float = 0.0
+    total_withdrawals: float = 0.0
+    ending_balance: float = 0.0
+    avg_daily_balance: float = 0.0
+    nsf_count: int = 0
+    negative_days: int = 0
+    largest_deposit: float = 0.0
+    deposit_count: int = 0
+    identified_mca_debits: float = 0.0  # daily/weekly ACH to known funders
+
+
+def _claude_parse_bank_statement(raw_text: str) -> list[dict] | None:
+    """Use Claude to extract structured monthly metrics from raw bank statement text."""
+    if not ANTHROPIC_API_KEY or not raw_text:
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        prompt = (
+            "You are a bank statement analyst. Extract monthly financial metrics from this bank statement text.\n\n"
+            "For EACH month present, return a JSON array of objects with these exact fields:\n"
+            "- month (string, e.g. '2026-01')\n"
+            "- total_deposits (float)\n"
+            "- total_withdrawals (float)\n"
+            "- ending_balance (float)\n"
+            "- avg_daily_balance (float, estimate from beginning/ending if not explicit)\n"
+            "- nsf_count (int, count of NSF/overdraft fees)\n"
+            "- negative_days (int, days balance was below zero)\n"
+            "- largest_deposit (float)\n"
+            "- deposit_count (int)\n"
+            "- identified_mca_debits (float, total of any recurring daily/weekly fixed ACH debits that look like MCA payments)\n\n"
+            "Return ONLY the JSON array, no markdown, no explanation.\n\n"
+            f"BANK STATEMENT TEXT:\n{raw_text[:8000]}"
+        )
+        resp = client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        text = text.strip("`").strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[analyzer] Claude parse failed: {e}")
+        return None
+
+
+def analyze_bank_statements(months: list[dict]) -> dict:
+    """
+    Compute all underwriting metrics from monthly bank statement data.
+    This is what lenders actually look at — the four dimensions.
+    """
+    if not months:
+        return {"error": "No monthly data provided", "metrics": {}}
+
+    deposits = [m.get("total_deposits", 0) for m in months]
+    balances = [m.get("avg_daily_balance", 0) or m.get("ending_balance", 0) for m in months]
+    nsfs = [m.get("nsf_count", 0) for m in months]
+    neg_days = [m.get("negative_days", 0) for m in months]
+    mca_debits = [m.get("identified_mca_debits", 0) for m in months]
+
+    avg_monthly_deposits = statistics.mean(deposits) if deposits else 0
+    avg_daily_balance = statistics.mean(balances) if balances else 0
+    total_nsfs = sum(nsfs)
+    avg_nsfs_per_month = round(total_nsfs / len(months), 1) if months else 0
+    max_neg_days = max(neg_days) if neg_days else 0
+    avg_neg_days = round(sum(neg_days) / len(months), 1) if months else 0
+    total_mca_debits = sum(mca_debits)
+
+    # Revenue trend: simple linear direction
+    if len(deposits) >= 2:
+        first_half = statistics.mean(deposits[:len(deposits)//2])
+        second_half = statistics.mean(deposits[len(deposits)//2:])
+        if second_half > first_half * 1.05:
+            trend = "growing"
+        elif second_half < first_half * 0.95:
+            trend = "declining"
+        else:
+            trend = "flat"
+    else:
+        trend = "insufficient_data"
+
+    # Deposit consistency (coefficient of variation)
+    cv = round(statistics.pstdev(deposits) / statistics.mean(deposits), 3) if len(deposits) >= 2 and statistics.mean(deposits) else 0
+
+    # Health ratings
+    nsf_rating = "green" if avg_nsfs_per_month < 1 else ("yellow" if avg_nsfs_per_month <= 3 else "red")
+    neg_rating = "green" if max_neg_days == 0 else ("yellow" if max_neg_days <= 5 else "red")
+    balance_rating = "green" if avg_daily_balance > 5000 else ("yellow" if avg_daily_balance > 1000 else "red")
+    trend_rating = "green" if trend == "growing" else ("yellow" if trend == "flat" else "red")
+
+    # Estimated available capacity for new MCA payment
+    est_monthly_operating_costs = avg_monthly_deposits * 0.85  # rough: 85% goes to operations
+    current_mca_burden = (total_mca_debits / len(months)) if months else 0
+    available_monthly = avg_monthly_deposits - est_monthly_operating_costs - current_mca_burden
+    estimated_capacity = max(available_monthly * 0.5, 0)  # conservative: only use 50% of available
+
+    return {
+        "month_count": len(months),
+        "months": months,
+        "avg_monthly_deposits": round(avg_monthly_deposits, 0),
+        "avg_daily_balance": round(avg_daily_balance, 0),
+        "total_nsfs": total_nsfs,
+        "avg_nsfs_per_month": avg_nsfs_per_month,
+        "max_negative_days_in_month": max_neg_days,
+        "avg_negative_days": avg_neg_days,
+        "revenue_trend": trend,
+        "deposit_consistency_cv": cv,
+        "existing_mca_debits_monthly": round(current_mca_burden, 0),
+        "estimated_daily_payment_capacity": round(estimated_capacity / 22, 0),  # ~22 business days
+        "ratings": {
+            "nsf": nsf_rating,
+            "negative_days": neg_rating,
+            "balance": balance_rating,
+            "trend": trend_rating,
+            "overall": "green" if all(r == "green" for r in [nsf_rating, neg_rating, balance_rating, trend_rating])
+                       else ("red" if any(r == "red" for r in [nsf_rating, neg_rating, trend_rating]) else "yellow"),
+        },
+    }
+
+
+@app.post("/api/analyze-statements")
+def analyze_statements(d: BankStatementInput, db: Session = Depends(get_db)):
+    """
+    Analyze bank statements. Accepts raw text (Claude extracts metrics) or
+    pre-computed monthly metrics. Returns the full underwriting analysis +
+    auto-qualification + lender matches.
+    """
+    months = d.months
+
+    # Claude extraction path
+    if d.raw_text and not months:
+        parsed = _claude_parse_bank_statement(d.raw_text)
+        if parsed:
+            months = parsed
+        else:
+            return {"error": "Couldn't parse bank statement text. Paste cleaner text or enter metrics manually.",
+                    "claude_available": bool(ANTHROPIC_API_KEY)}
+
+    if not months:
+        return {"error": "Provide bank statement text (raw_text) or monthly metrics (months)."}
+
+    analysis = analyze_bank_statements(months)
+
+    # Auto-qualify based on the analysis
+    deal = db.get(Deal, d.deal_id) if d.deal_id else None
+    q = qualify_deal(QualifyInput(
+        industry=deal.industry if deal else "",
+        time_in_business_months=deal.time_in_business_months if deal else 12,
+        monthly_revenue=analysis["avg_monthly_deposits"],
+        existing_positions=1 if analysis["existing_mca_debits_monthly"] > 0 else 0,
+        credit_range=deal.credit_range if deal else "600-650",
+        nsf_count=round(analysis["avg_nsfs_per_month"]),
+        negative_days=analysis["max_negative_days_in_month"],
+        revenue_trend=analysis["revenue_trend"],
+        amount_requested=deal.amount_requested if deal else analysis["avg_monthly_deposits"],
+        timeline=deal.timeline if deal else "",
+    ))
+    analysis["qualification"] = q
+
+    # Match lenders if qualified
+    if q["qualified"]:
+        matches = match_lenders(QualifyInput(
+            industry=deal.industry if deal else "",
+            time_in_business_months=deal.time_in_business_months if deal else 12,
+            monthly_revenue=analysis["avg_monthly_deposits"],
+            existing_positions=1 if analysis["existing_mca_debits_monthly"] > 0 else 0,
+            credit_range=deal.credit_range if deal else "600-650",
+            amount_requested=deal.amount_requested if deal else analysis["avg_monthly_deposits"],
+            timeline=deal.timeline if deal else "",
+        ), q["paper_grade"], db)
+        analysis["lender_matches"] = matches[:3]
+
+    # Update the deal if linked
+    if deal:
+        deal.monthly_revenue = analysis["avg_monthly_deposits"]
+        deal.nsf_count = round(analysis["avg_nsfs_per_month"])
+        deal.negative_days = analysis["max_negative_days_in_month"]
+        deal.avg_daily_balance = analysis["avg_daily_balance"]
+        deal.revenue_trend = analysis["revenue_trend"]
+        deal.qual_score = q["qual_score"]
+        deal.paper_grade = q["paper_grade"]
+        deal.matched_lenders = json.dumps(analysis.get("lender_matches", []))
+        if analysis.get("lender_matches"):
+            deal.estimated_commission = analysis["lender_matches"][0]["estimated_commission"]
+        deal.updated_at = _now()
+        db.commit()
+        analysis["deal_updated"] = deal.id
+
+    return analysis
+
+
+# ===========================================================================
+# REFERRAL PARTNERS
+# ===========================================================================
+
+class PartnerInput(BaseModel):
+    name: str
+    partner_type: str = "accountant"
+    email: str = ""
+    phone: str = ""
+    split_pct: float = 25.0
+    notes: str = ""
+
+
+@app.get("/api/partners")
+def list_partners(db: Session = Depends(get_db)):
+    partners = db.execute(select(ReferralPartner).order_by(ReferralPartner.name)).scalars().all()
+    return {"count": len(partners), "partners": [p.to_dict() for p in partners]}
+
+
+@app.post("/api/partners")
+def add_partner(d: PartnerInput, db: Session = Depends(get_db)):
+    p = ReferralPartner(**d.model_dump())
+    db.add(p)
+    db.commit()
+    return p.to_dict()
+
+
+@app.put("/api/partners/{partner_id}/record-referral")
+def record_referral(partner_id: str, funded: bool = False, commission: float = 0.0, db: Session = Depends(get_db)):
+    p = db.get(ReferralPartner, partner_id)
+    if not p:
+        raise HTTPException(404, "Partner not found")
+    p.referrals_sent = (p.referrals_sent or 0) + 1
+    if funded:
+        p.referrals_funded = (p.referrals_funded or 0) + 1
+        split = round(commission * (p.split_pct / 100), 2)
+        p.total_paid = (p.total_paid or 0) + split
+    p.last_contact = _now()
+    db.commit()
+    return p.to_dict()
+
+
+# ===========================================================================
+# COMMISSION TRACKER
+# ===========================================================================
+
+@app.get("/api/commissions")
+def commission_tracker(db: Session = Depends(get_db)):
+    """Full commission breakdown: earned, pending, projected renewals."""
+    deals = db.execute(select(Deal)).scalars().all()
+    earned = sum(d.actual_commission or 0 for d in deals if d.stage == "Funded")
+    pending_deals = [d for d in deals if d.stage in ("Submitted", "Approved")]
+    pending = sum(d.estimated_commission or 0 for d in pending_deals)
+
+    # Revenue by lender
+    by_lender = {}
+    for d in deals:
+        if d.stage == "Funded" and d.submitted_to:
+            by_lender[d.submitted_to] = by_lender.get(d.submitted_to, 0) + (d.actual_commission or 0)
+
+    # Monthly trend
+    monthly = {}
+    for d in deals:
+        if d.stage == "Funded" and d.funded_at:
+            key = d.funded_at.strftime("%Y-%m")
+            monthly[key] = monthly.get(key, 0) + (d.actual_commission or 0)
+
+    # Partner splits owed
+    partners = db.execute(select(ReferralPartner)).scalars().all()
+    partner_splits = [{"name": p.name, "referrals_funded": p.referrals_funded or 0,
+                       "total_paid": p.total_paid or 0, "split_pct": p.split_pct} for p in partners if p.referrals_funded]
+
+    funded_deals = [d for d in deals if d.stage == "Funded"]
+    ttfs = [(d.funded_at.date() - d.contacted_at.date()).days for d in funded_deals if d.funded_at and d.contacted_at]
+
+    return {
+        "earned": round(earned, 2),
+        "pending": round(pending, 2),
+        "total_deals_funded": len(funded_deals),
+        "avg_commission": round(earned / len(funded_deals), 2) if funded_deals else 0,
+        "avg_time_to_fund": round(statistics.mean(ttfs), 1) if ttfs else None,
+        "by_lender": by_lender,
+        "monthly": monthly,
+        "partner_splits": partner_splits,
+        "pending_deals": [{"id": d.id, "business": d.business_name, "estimated": d.estimated_commission,
+                           "submitted_to": d.submitted_to, "stage": d.stage} for d in pending_deals],
+    }
+
+
+# ===========================================================================
+# FOLLOW-UP ENGINE
+# ===========================================================================
+
+FOLLOWUP_CADENCE = [1, 3, 7, 14, 30]
+
+
+@app.post("/api/deals/{deal_id}/schedule-followup")
+def schedule_followup(deal_id: str, days: int = 0, db: Session = Depends(get_db)):
+    deal = db.get(Deal, deal_id)
+    if not deal:
+        raise HTTPException(404, "Deal not found")
+    if days <= 0:
+        # Auto-cadence based on stage
+        stage_defaults = {"Signal": 1, "Contacted": 3, "Qualifying": 2, "Submitted": 1, "Approved": 1}
+        days = stage_defaults.get(deal.stage, 3)
+    deal.next_follow_up = _now() + timedelta(days=days)
+    deal.updated_at = _now()
+    db.commit()
+    return deal.to_dict()
+
+
+@app.get("/api/followups/due")
+def followups_due(db: Session = Depends(get_db)):
+    now = _now()
+    deals = db.execute(select(Deal).where(Deal.next_follow_up.isnot(None)).where(
+        Deal.stage.notin_(["Funded", "Lost"])
+    )).scalars().all()
+    due = []
+    for d in deals:
+        fu = d.next_follow_up
+        if fu.tzinfo is None:
+            fu = fu.replace(tzinfo=timezone.utc)
+        days = (fu.date() - now.date()).days
+        if days <= 1:  # due today or overdue
+            row = d.to_dict()
+            row["overdue_days"] = abs(days) if days < 0 else 0
+            due.append(row)
+    due.sort(key=lambda x: x.get("overdue_days", 0), reverse=True)
+    return {"count": len(due), "deals": due}
+
+
+# ===========================================================================
 # OUTREACH DRAFTING (drafts only; you send from your own mail app)
 # ===========================================================================
 
@@ -1004,7 +1344,7 @@ DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard")
 if os.path.isdir(DASHBOARD_DIR):
     @app.get("/")
     def root():
-        from fastapi.responses import RedirectResponse; return RedirectResponse("/dashboard/")
+        return RedirectResponse("/dashboard/")
     app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard")
 
 

@@ -105,6 +105,10 @@
     <a data-page="qualify">Qualifier</a>
     <a data-page="lenders">Lenders</a>
     <a data-page="sources">Sources</a>
+    <a data-page="analyzer">Analyzer</a>
+    <a data-page="partners">Partners</a>
+    <a data-page="commissions">$$$ Tracker</a>
+    <a data-page="followups">Follow-ups</a>
   </nav>
   <main>
     <!-- HOME -->
@@ -180,6 +184,75 @@
       <div class="grid cols-3" id="sources-stats" style="margin-bottom:18px"></div>
       <div class="card"><div id="sources-list"></div></div>
     </div>
+    <!-- ANALYZER -->
+    <div class="page" id="page-analyzer">
+      <div class="eyebrow">Phase 2</div>
+      <h1>Bank Statement Analyzer</h1>
+      <p class="sub">Enter monthly metrics from bank statements. The system computes all underwriting dimensions, auto-qualifies, and matches lenders.</p>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>Month 1 (most recent)</h3>
+          <div class="grid cols-2">
+            <label class="field"><span class="lbl">Month</span><input id="bs-m1" value="2026-05"></label>
+            <label class="field"><span class="lbl">Total deposits ($)</span><input id="bs-d1" type="number"></label>
+            <label class="field"><span class="lbl">Ending balance ($)</span><input id="bs-b1" type="number"></label>
+            <label class="field"><span class="lbl">NSFs</span><input id="bs-n1" type="number" value="0"></label>
+            <label class="field"><span class="lbl">Negative days</span><input id="bs-nd1" type="number" value="0"></label>
+            <label class="field"><span class="lbl">MCA debits ($)</span><input id="bs-mca1" type="number" value="0"></label>
+          </div>
+          <h3 style="margin-top:14px">Month 2</h3>
+          <div class="grid cols-2">
+            <label class="field"><span class="lbl">Month</span><input id="bs-m2" value="2026-04"></label>
+            <label class="field"><span class="lbl">Total deposits ($)</span><input id="bs-d2" type="number"></label>
+            <label class="field"><span class="lbl">Ending balance ($)</span><input id="bs-b2" type="number"></label>
+            <label class="field"><span class="lbl">NSFs</span><input id="bs-n2" type="number" value="0"></label>
+            <label class="field"><span class="lbl">Negative days</span><input id="bs-nd2" type="number" value="0"></label>
+            <label class="field"><span class="lbl">MCA debits ($)</span><input id="bs-mca2" type="number" value="0"></label>
+          </div>
+          <h3 style="margin-top:14px">Month 3</h3>
+          <div class="grid cols-2">
+            <label class="field"><span class="lbl">Month</span><input id="bs-m3" value="2026-03"></label>
+            <label class="field"><span class="lbl">Total deposits ($)</span><input id="bs-d3" type="number"></label>
+            <label class="field"><span class="lbl">Ending balance ($)</span><input id="bs-b3" type="number"></label>
+            <label class="field"><span class="lbl">NSFs</span><input id="bs-n3" type="number" value="0"></label>
+            <label class="field"><span class="lbl">Negative days</span><input id="bs-nd3" type="number" value="0"></label>
+            <label class="field"><span class="lbl">MCA debits ($)</span><input id="bs-mca3" type="number" value="0"></label>
+          </div>
+          <button class="btn primary" style="width:100%;margin-top:16px" onclick="runAnalyzer()">Analyze</button>
+        </div>
+        <div class="card" id="analyzer-result"><div class="empty">Enter bank statement metrics and click Analyze.</div></div>
+      </div>
+    </div>
+
+    <!-- PARTNERS -->
+    <div class="page" id="page-partners">
+      <div class="eyebrow">Referral Network</div>
+      <h1>Partners</h1>
+      <p class="sub">Your accountants, bookkeepers, and other referral sources. One good partner can send 4-6 deals a year.</p>
+      <div class="btn-row" style="margin-bottom:16px"><button class="btn primary" onclick="addPartnerPrompt()">+ Add partner</button></div>
+      <div class="card"><div id="partners-list"></div></div>
+    </div>
+
+    <!-- COMMISSIONS -->
+    <div class="page" id="page-commissions">
+      <div class="eyebrow">Money</div>
+      <h1>Commission Tracker</h1>
+      <p class="sub">Earned, pending, and projected. This is why you're doing this.</p>
+      <div class="grid cols-4" id="commission-stats"></div>
+      <div class="grid cols-2" style="margin-top:18px">
+        <div class="card"><h3>By lender</h3><div id="comm-lender"></div></div>
+        <div class="card"><h3>Pending deals</h3><div id="comm-pending"></div></div>
+      </div>
+    </div>
+
+    <!-- FOLLOW-UPS -->
+    <div class="page" id="page-followups">
+      <div class="eyebrow">Don't drop the ball</div>
+      <h1>Follow-ups Due</h1>
+      <p class="sub">Deals that need your attention today. Click to open the deal.</p>
+      <div class="card"><div id="followups-list"></div></div>
+    </div>
+
   </main>
 </div>
 <div class="toast" id="toast"></div>
@@ -349,7 +422,124 @@ async function pageSources(){
   } catch(e){ toast(e.message); }
 }
 
-const routes = { home: pageHome, signals: loadSignals, pipeline: pagePipeline, qualify: ()=>{}, lenders: pageLenders, sources: pageSources };
+// ANALYZER
+async function runAnalyzer(){
+  const m = (i)=>({
+    month: document.getElementById('bs-m'+i).value,
+    total_deposits: +document.getElementById('bs-d'+i).value||0,
+    ending_balance: +document.getElementById('bs-b'+i).value||0,
+    nsf_count: +document.getElementById('bs-n'+i).value||0,
+    negative_days: +document.getElementById('bs-nd'+i).value||0,
+    identified_mca_debits: +document.getElementById('bs-mca'+i).value||0,
+  });
+  const months = [m(1),m(2),m(3)].filter(x=>x.total_deposits>0);
+  if(!months.length){toast('Enter at least one month of deposits');return;}
+  try{
+    const r = await API.post('/api/analyze-statements',{months});
+    const host = document.getElementById('analyzer-result');
+    const rt = r.ratings||{};
+    const dot = (c)=>c==='green'?'var(--green)':c==='red'?'var(--red)':'var(--amber)';
+    let html = `<div class="grid cols-2" style="gap:10px;margin-bottom:14px">
+      <div class="stat"><div class="label">Avg monthly deposits</div><div class="value cyan">${money(r.avg_monthly_deposits)}</div></div>
+      <div class="stat"><div class="label">Avg daily balance</div><div class="value">${money(r.avg_daily_balance)}</div></div>
+      <div class="stat"><div class="label">Revenue trend</div><div class="value" style="color:${dot(rt.trend)}">${r.revenue_trend}</div></div>
+      <div class="stat"><div class="label">Overall health</div><div class="value" style="color:${dot(rt.overall)}">${rt.overall}</div></div>
+    </div>`;
+    html += `<div style="margin-bottom:14px">
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <span>NSFs: <b style="color:${dot(rt.nsf)}">${r.avg_nsfs_per_month}/mo</b></span>
+        <span>Neg days: <b style="color:${dot(rt.negative_days)}">${r.max_negative_days_in_month} max</b></span>
+        <span>MCA debits: <b>${money(r.existing_mca_debits_monthly)}/mo</b></span>
+        <span>Daily capacity: <b style="color:var(--cyan)">${money(r.estimated_daily_payment_capacity)}/day</b></span>
+      </div></div>`;
+    const q = r.qualification||{};
+    if(q.qualified){
+      html += `<div style="font-size:24px;font-weight:800;margin:10px 0">Grade <span class="pill grade-${q.paper_grade}" style="font-size:20px;padding:3px 12px">${q.paper_grade}</span> · Score ${q.qual_score}</div>`;
+      html += q.reasons.map(x=>`<div style="color:var(--green);font-size:13px">✓ ${esc(x)}</div>`).join('');
+      if(r.lender_matches){
+        html += `<h3 style="margin-top:16px">Matched lenders</h3>`;
+        html += r.lender_matches.map(m=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
+          <span><strong>${esc(m.lender_name)}</strong> · ${m.commission_pct}%</span>
+          <span style="color:var(--amber)">${money(m.estimated_commission)}</span></div>`).join('');
+      }
+    } else {
+      html += `<div style="color:var(--red);font-size:18px;font-weight:700;margin:10px 0">Does not qualify</div>`;
+      html += (q.disqualifiers||[]).map(x=>`<div style="color:var(--red);font-size:13px">✕ ${esc(x)}</div>`).join('');
+    }
+    host.innerHTML = html;
+    toast('Analysis complete');
+  }catch(e){toast(e.message);}
+}
+
+// PARTNERS
+async function pagePartners(){
+  try{
+    const d = await API.get('/api/partners');
+    const host = document.getElementById('partners-list');
+    if(!d.partners.length){host.innerHTML='<div class="empty">No partners yet. Add your first accountant or bookkeeper referral source.</div>';return;}
+    host.innerHTML = `<table><thead><tr><th>Partner</th><th>Type</th><th>Contact</th><th>Split</th><th>Referrals</th><th>Paid</th></tr></thead><tbody>`+
+      d.partners.map(p=>`<tr>
+        <td><strong>${esc(p.name)}</strong></td>
+        <td><span class="pill cyan">${esc(p.partner_type)}</span></td>
+        <td>${esc(p.email||p.phone||'—')}</td>
+        <td>${p.split_pct}%</td>
+        <td>${p.referrals_sent} sent · ${p.referrals_funded} funded</td>
+        <td style="color:var(--green)">${money(p.total_paid)}</td>
+      </tr>`).join('')+`</tbody></table>`;
+  }catch(e){toast(e.message);}
+}
+async function addPartnerPrompt(){
+  const name=prompt('Partner name (e.g. Sarah Chen CPA):');
+  if(!name)return;
+  const type=prompt('Type (accountant/bookkeeper/lawyer/other):','accountant');
+  const email=prompt('Email:','');
+  try{
+    await API.post('/api/partners',{name,partner_type:type||'accountant',email:email||''});
+    toast('Partner added');
+    pagePartners();
+  }catch(e){toast(e.message);}
+}
+
+// COMMISSIONS
+async function pageCommissions(){
+  try{
+    const d = await API.get('/api/commissions');
+    document.getElementById('commission-stats').innerHTML = `
+      <div class="stat"><div class="label">Earned</div><div class="value green">${money(d.earned)}</div></div>
+      <div class="stat"><div class="label">Pending</div><div class="value amber">${money(d.pending)}</div></div>
+      <div class="stat"><div class="label">Deals funded</div><div class="value">${d.total_deals_funded}</div></div>
+      <div class="stat"><div class="label">Avg per deal</div><div class="value cyan">${money(d.avg_commission)}</div></div>`;
+    const lh = document.getElementById('comm-lender');
+    const lenders = Object.entries(d.by_lender||{});
+    lh.innerHTML = lenders.length ? lenders.map(([name,amt])=>`<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)">
+      <span>${esc(name)}</span><span style="color:var(--green)">${money(amt)}</span></div>`).join('') : '<div class="empty">No funded deals yet</div>';
+    const ph = document.getElementById('comm-pending');
+    ph.innerHTML = d.pending_deals.length ? d.pending_deals.map(x=>`<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <strong>${esc(x.business)}</strong> → ${esc(x.submitted_to||'TBD')} · <span style="color:var(--amber)">${money(x.estimated)}</span></div>`).join('') : '<div class="empty">No pending deals</div>';
+  }catch(e){toast(e.message);}
+}
+
+// FOLLOW-UPS
+async function pageFollowups(){
+  try{
+    const d = await API.get('/api/followups/due');
+    const host = document.getElementById('followups-list');
+    if(!d.deals.length){host.innerHTML='<div class="empty">Nothing due today. Nice work.</div>';return;}
+    host.innerHTML = `<table><thead><tr><th>Overdue</th><th>Business</th><th>Stage</th><th>Est. Commission</th></tr></thead><tbody>`+
+      d.deals.map(x=>{
+        const od = x.overdue_days;
+        return `<tr>
+          <td>${od>0?`<span style="color:var(--red)">${od}d overdue</span>`:'<span style="color:var(--amber)">today</span>'}</td>
+          <td><strong>${esc(x.business_name)}</strong></td>
+          <td><span class="pill cyan">${esc(x.stage)}</span></td>
+          <td style="color:var(--amber)">${money(x.estimated_commission)}</td>
+        </tr>`;
+      }).join('')+`</tbody></table>`;
+  }catch(e){toast(e.message);}
+}
+
+const routes = { home: pageHome, signals: loadSignals, pipeline: pagePipeline, qualify: ()=>{}, lenders: pageLenders, sources: pageSources,
+  analyzer: ()=>{}, partners: pagePartners, commissions: pageCommissions, followups: pageFollowups };
 pageHome();
 </script>
 </body>

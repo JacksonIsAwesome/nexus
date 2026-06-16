@@ -1336,6 +1336,331 @@ class CountyCourtRecords(Collector):
         return []
 
 
+# ---- 56. Hunter.io Email Finder ----
+class HunterEmailFinder(Collector):
+    name = "hunter_email_finder"
+    description = "Find business owner emails for outreach enrichment"
+    source_type = "api"
+    schedule = "daily"
+    requires_key = "HUNTER_API_KEY"
+    tier = "C"
+    default_strength = 10.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        # Enrichment collector — called per-business, not in bulk scan
+        _log(self.name, "Hunter.io is an enrichment tool — use via /api/enrich endpoint")
+        return []
+
+
+# ---- 57. Google Jobs API ----
+class GoogleJobsSearch(Collector):
+    name = "google_jobs"
+    description = "Google Jobs aggregation — catches postings from multiple job boards"
+    source_type = "scrape"
+    schedule = "daily"
+    tier = "B"
+    default_strength = 22.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        location = kwargs.get("location", "Minneapolis, MN")
+        queries = ["hiring multiple positions", "urgently hiring", "immediate start"]
+        for q in queries[:2]:
+            resp = self._scrape_get(f"https://www.google.com/search?q={quote_plus(q + ' ' + location)}&ibp=htl;jobs")
+            if not resp:
+                continue
+            companies = re.findall(r'"([^"]{3,40})"\s*,\s*"(?:Full-time|Part-time|Contract)', resp.text)
+            for co in set(companies[:10]):
+                signals.append(Signal(
+                    business_name=co.strip(), location=location,
+                    signal_type="hiring_urgently", strength=self.default_strength,
+                    source=self.name, raw_data={"query": q},
+                ))
+        _log(self.name, f"found {len(signals)} Google Jobs signals")
+        return signals
+
+
+# ---- 58. Bing News — Business Expansion ----
+class BingNewsExpansion(Collector):
+    name = "bing_news_expansion"
+    description = "Local news about business expansions, new locations, funding rounds"
+    source_type = "scrape"
+    schedule = "daily"
+    tier = "B"
+    default_strength = 22.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        queries = ["business expansion Minneapolis", "new restaurant opening Minnesota", "company funding Minnesota"]
+        for q in queries:
+            resp = self._scrape_get(f"https://www.bing.com/news/search?q={quote_plus(q)}&qft=sortbydate%3d%221%22")
+            if not resp:
+                continue
+            titles = re.findall(r'class="title"[^>]*>([^<]+)<', resp.text)
+            for t in titles[:5]:
+                signals.append(Signal(
+                    business_name=t.strip()[:80], location="Minnesota",
+                    signal_type="business_expansion_news", strength=self.default_strength,
+                    source=self.name, raw_data={"headline": t.strip()},
+                ))
+        _log(self.name, f"found {len(signals)} news signals")
+        return signals
+
+
+# ---- 59. Minnesota Business Licenses ----
+class MNBusinessLicenses(Collector):
+    name = "mn_business_licenses"
+    description = "New business license applications in MN cities"
+    source_type = "scrape"
+    schedule = "weekly"
+    tier = "B"
+    default_strength = 20.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        _log(self.name, "MN city license portals require per-city scraper — planned for v0.3")
+        return []
+
+
+# ---- 60. SBA Disaster Loans ----
+class SBADisasterLoans(Collector):
+    name = "sba_disaster_loans"
+    description = "SBA disaster loan data — affected businesses may need additional capital"
+    source_type = "api"
+    schedule = "monthly"
+    tier = "B"
+    default_strength = 24.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        resp = self._get("https://data.sba.gov/api/views/nsei-6cj5/rows.json?accessType=DOWNLOAD")
+        # SBA disaster loan data is large; this is a lightweight check
+        _log(self.name, "SBA disaster data requires bulk processing — planned for v0.3")
+        return signals
+
+
+# ---- 61. Facebook Marketplace Businesses ----
+class FacebookMarketplace(Collector):
+    name = "facebook_marketplace"
+    description = "Businesses for sale on Facebook Marketplace — informal, motivated sellers"
+    source_type = "scrape"
+    schedule = "weekly"
+    market = "micro_acq"
+    tier = "B"
+    default_strength = 18.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        _log(self.name, "Facebook Marketplace requires auth — planned for v0.3")
+        return []
+
+
+# ---- 62. Thumbtack / HomeAdvisor Pros ----
+class ThumbTackPros(Collector):
+    name = "thumbtack_pros"
+    description = "Service pros on Thumbtack — active contractors who may need working capital"
+    source_type = "scrape"
+    schedule = "weekly"
+    tier = "C"
+    default_strength = 14.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        categories = ["plumbing", "hvac", "electrical", "roofing", "painting"]
+        for cat in categories[:3]:
+            resp = self._scrape_get(f"https://www.thumbtack.com/mn/minneapolis/{cat}/")
+            if not resp:
+                continue
+            names = re.findall(r'"name"\s*:\s*"([^"]{3,60})"', resp.text)
+            for n in set(list(names)[:5]):
+                signals.append(Signal(
+                    business_name=n.strip(), location="Minneapolis, MN",
+                    signal_type=f"active_service_pro_{cat}", strength=self.default_strength,
+                    source=self.name, raw_data={"category": cat},
+                ))
+        _log(self.name, f"found {len(signals)} Thumbtack signals")
+        return signals
+
+
+# ---- 63. Yelp "New Business" Filter ----
+class YelpNewBusinesses(Collector):
+    name = "yelp_new_businesses"
+    description = "Recently opened businesses on Yelp — startups needing capital"
+    source_type = "scrape"
+    schedule = "weekly"
+    tier = "B"
+    default_strength = 20.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        location = kwargs.get("location", "Minneapolis, MN")
+        resp = self._scrape_get(f"https://www.yelp.com/search?find_desc=new+business&find_loc={quote_plus(location)}&attrs=BusinessOpenedRecently")
+        if not resp:
+            return signals
+        names = re.findall(r'"name"\s*:\s*"([^"]{3,60})"', resp.text)
+        for n in set(list(names)[:10]):
+            signals.append(Signal(
+                business_name=n.strip(), location=location,
+                signal_type="new_business_opened", strength=self.default_strength,
+                source=self.name,
+            ))
+        _log(self.name, f"found {len(signals)} new business signals")
+        return signals
+
+
+# ---- 64. DoorDash / UberEats Restaurant Growth ----
+class FoodDeliveryGrowth(Collector):
+    name = "food_delivery_growth"
+    description = "Restaurants active on delivery platforms — growing revenue, may need capital"
+    source_type = "scrape"
+    schedule = "weekly"
+    tier = "C"
+    default_strength = 14.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        _log(self.name, "Delivery platform scraping requires specialized approach — planned for v0.3")
+        return []
+
+
+# ---- 65. Minnesota DEED Job Vacancy Survey ----
+class MNDEEDJobVacancies(Collector):
+    name = "mn_deed_vacancies"
+    description = "MN DEED job vacancy data — industries with labor shortages need capital to compete"
+    source_type = "api"
+    schedule = "monthly"
+    tier = "C"
+    default_strength = 12.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        _log(self.name, "MN DEED vacancy data requires bulk download — planned for v0.3")
+        return []
+
+
+# ---- 66. Commercial Truck Sales ----
+class CommercialTruckSales(Collector):
+    name = "commercial_truck_sales"
+    description = "Commercial truck listings — trucking companies buying trucks need capital"
+    source_type = "scrape"
+    schedule = "weekly"
+    tier = "B"
+    default_strength = 20.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        resp = self._scrape_get("https://www.commercialtrucktrader.com/listing?state=MN")
+        if not resp:
+            return signals
+        # Look for dealers posting multiple listings (they have buyer customers)
+        dealers = re.findall(r'"dealerName"\s*:\s*"([^"]+)"', resp.text)
+        counts: dict[str, int] = {}
+        for d in dealers:
+            counts[d] = counts.get(d, 0) + 1
+        for dealer, cnt in counts.items():
+            if cnt >= 3:
+                signals.append(Signal(
+                    business_name=dealer, location="Minnesota",
+                    signal_type="commercial_vehicle_activity", strength=self.default_strength,
+                    source=self.name, raw_data={"listing_count": cnt},
+                ))
+        _log(self.name, f"found {len(signals)} truck signals")
+        return signals
+
+
+# ---- 67. Startup MN / MN Cup ----
+class StartupMN(Collector):
+    name = "startup_mn"
+    description = "Minnesota startup ecosystem — early companies needing capital"
+    source_type = "scrape"
+    schedule = "monthly"
+    tier = "B"
+    default_strength = 18.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        resp = self._scrape_get("https://www.startribune.com/business/technology/")
+        if not resp:
+            return signals
+        headlines = re.findall(r'<h[23][^>]*>.*?<a[^>]*>([^<]+)</a>', resp.text)
+        for h in headlines[:10]:
+            if any(kw in h.lower() for kw in ["startup", "raises", "funding", "launch", "opens", "expands"]):
+                signals.append(Signal(
+                    business_name=h.strip()[:80], location="Minnesota",
+                    signal_type="startup_news", strength=self.default_strength,
+                    source=self.name, raw_data={"headline": h.strip()},
+                ))
+        _log(self.name, f"found {len(signals)} startup MN signals")
+        return signals
+
+
+# ---- 68. Minneapolis / St Paul Business Journal ----
+class MSPBizJournal(Collector):
+    name = "msp_biz_journal"
+    description = "MSP Business Journal — local business news, expansions, new openings"
+    source_type = "scrape"
+    schedule = "weekly"
+    tier = "B"
+    default_strength = 20.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        resp = self._scrape_get("https://www.bizjournals.com/twincities/news")
+        if not resp:
+            return signals
+        titles = re.findall(r'data-title="([^"]+)"', resp.text)
+        if not titles:
+            titles = re.findall(r'<h[23][^>]*>([^<]{10,80})</h[23]>', resp.text)
+        for t in titles[:10]:
+            if any(kw in t.lower() for kw in ["opens", "expands", "hires", "grows", "raises", "acquires", "launch"]):
+                signals.append(Signal(
+                    business_name=t.strip()[:80], location="Twin Cities, MN",
+                    signal_type="local_biz_news", strength=self.default_strength,
+                    source=self.name, raw_data={"headline": t.strip()},
+                ))
+        _log(self.name, f"found {len(signals)} biz journal signals")
+        return signals
+
+
+# ---- 69. IRS Tax Exempt Org Search ----
+class IRSTaxExemptOrgs(Collector):
+    name = "irs_tax_exempt"
+    description = "Recently registered nonprofits/orgs — some have fundable subsidiaries or need bridge capital"
+    source_type = "api"
+    schedule = "monthly"
+    tier = "C"
+    default_strength = 10.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        # IRS Exempt Org search has a public endpoint
+        _log(self.name, "IRS exempt org search requires bulk CSV processing — planned for v0.3")
+        return []
+
+
+# ---- 70. Medical/Dental Practice Openings ----
+class MedicalPracticeOpenings(Collector):
+    name = "medical_practice_openings"
+    description = "New medical/dental practices — high-revenue businesses needing equipment + buildout capital"
+    source_type = "scrape"
+    schedule = "weekly"
+    tier = "A"
+    default_strength = 28.0
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        for specialty in ["dentist", "medical practice", "veterinary clinic"]:
+            resp = self._scrape_get(f"https://www.indeed.com/jobs?q={quote_plus(specialty + ' hiring')}&l={quote_plus('Minneapolis, MN')}&sort=date&limit=10")
+            if not resp:
+                continue
+            companies = re.findall(r'data-testid="company-name"[^>]*>([^<]+)<', resp.text)
+            if not companies:
+                companies = re.findall(r'"companyName"\s*:\s*"([^"]+)"', resp.text)
+            for co in set(companies[:5]):
+                signals.append(Signal(
+                    business_name=co.strip(), location="Minneapolis, MN",
+                    signal_type=f"medical_practice_hiring", strength=self.default_strength,
+                    source=self.name, raw_data={"specialty": specialty},
+                ))
+        _log(self.name, f"found {len(signals)} medical practice signals")
+        return signals
+
+
 # ===========================================================================
 # COLLECTOR REGISTRY
 # ===========================================================================
@@ -1401,6 +1726,23 @@ ALL_COLLECTORS: list[type[Collector]] = [
     GlassdoorReviews,          # 51
     SSLCertExpiry,             # 52
     AngelListStartups,         # 54
+
+    # v0.2 additions
+    HunterEmailFinder,         # 56
+    GoogleJobsSearch,          # 57
+    BingNewsExpansion,         # 58
+    MNBusinessLicenses,        # 59
+    SBADisasterLoans,          # 60
+    FacebookMarketplace,       # 61
+    ThumbTackPros,             # 62
+    YelpNewBusinesses,         # 63
+    FoodDeliveryGrowth,        # 64
+    MNDEEDJobVacancies,        # 65
+    CommercialTruckSales,      # 66
+    StartupMN,                 # 67
+    MSPBizJournal,             # 68
+    IRSTaxExemptOrgs,          # 69
+    MedicalPracticeOpenings,   # 70
 ]
 
 
