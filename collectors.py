@@ -196,9 +196,7 @@ class USASpendingAwards(Collector):
 
     def collect(self, **kwargs) -> list[Signal]:
         signals = []
-        # USASpending API is free, no key needed
-        resp = self._get("https://api.usaspending.gov/api/v2/search/spending_by_award/", params=None, headers={"Content-Type": "application/json"})
-        # POST endpoint — use httpx directly
+        # USASpending API is free, no key needed — POST endpoint
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT) as c:
                 body = {
@@ -798,7 +796,7 @@ class RedditSmallBusiness(Collector):
             resp = self._get(f"https://www.reddit.com/r/{sub}/search.json", params={
                 "q": " OR ".join(keywords[:3]), "sort": "new", "t": "week", "limit": 10,
                 "restrict_sr": "on",
-            }, headers={"User-Agent": USER_AGENT})
+            }, headers={"User-Agent": "NexusBot/1.0 (business research tool)"})
             if not resp:
                 continue
             try:
@@ -1849,14 +1847,98 @@ def score_signal(sig: Signal, all_signals_for_business: list[Signal] = None,
     return round(min(total, 100), 1)
 
 
+# ---------------------------------------------------------------------------
+# Signal quality filter — catches garbage before it hits the dashboard
+# ---------------------------------------------------------------------------
+
+# Generic words that aren't real business names
+_GARBAGE_NAMES = {
+    "video editing", "photo editing", "web design", "graphic design", "social media",
+    "marketing", "consulting", "freelance", "remote work", "side hustle", "online business",
+    "make money", "work from home", "passive income", "dropshipping", "affiliate",
+    "crypto", "nft", "bitcoin", "forex", "trading", "investment opportunity",
+    "click here", "sign up", "free trial", "download", "subscribe", "follow",
+    "loading", "error", "undefined", "null", "none", "test", "example",
+    "untitled", "no title", "new post", "draft", "placeholder",
+    "", " ",
+}
+
+# Minimum name length and word requirements
+_MIN_NAME_LENGTH = 4
+_MIN_WORD_LENGTH = 2  # at least 2 words for most signal types
+
+
+def _is_valid_signal(sig: Signal) -> bool:
+    """
+    Returns True if this signal looks like a real business lead.
+    Filters out generic product descriptions, spam, and parsing artifacts.
+    """
+    name = (sig.business_name or "").strip()
+
+    # Too short
+    if len(name) < _MIN_NAME_LENGTH:
+        return False
+
+    # Known garbage
+    if name.lower() in _GARBAGE_NAMES:
+        return False
+
+    # All lowercase single word under 15 chars = probably a generic term, not a business
+    # (e.g. "video editing", "plumbing", "roofing")
+    words = name.split()
+    if len(words) == 1 and len(name) < 15 and name.islower():
+        return False
+
+    # Starts with common HTML/JSON artifacts
+    if name.startswith(("{", "[", "<", "http", "www.", "/", "#")):
+        return False
+
+    # All caps single short word = probably an acronym pulled from HTML, not a real name
+    if len(words) == 1 and name.isupper() and len(name) < 5:
+        return False
+
+    # Contains obvious non-business patterns
+    lower = name.lower()
+    spam_patterns = ["click here", "sign up", "free", "discount", "limited time",
+                     "act now", "subscribe", "unsubscribe", "cookie", "privacy policy"]
+    if any(p in lower for p in spam_patterns):
+        return False
+
+    # For Product Hunt signals specifically, require at least 2 words or a capital letter
+    # (filters out single-word generic tool names)
+    if sig.source == "product_hunt":
+        if len(words) < 2 and not any(c.isupper() for c in name[1:]):
+            return False
+
+    # For SEC signals, filter out obviously-non-business entries
+    if sig.source == "sec_edgar_filings":
+        if len(name) < 5 or name.lower() in {"sec", "commission", "united states", "department"}:
+            return False
+
+    # Seasonal/internal signals always pass (they're hand-curated)
+    if sig.source in ("seasonal_calendar",):
+        return True
+
+    return True
+
+
 def rank_signals(signals: list[Signal], known_businesses: set[str] = None,
                  past_clients: set[str] = None) -> list[dict]:
     """
     Score and rank all signals, grouping by business name.
+    Filters out garbage/generic signals before ranking.
     Returns a sorted list of dicts ready for the dashboard.
     """
     known = known_businesses or set()
     clients = past_clients or set()
+
+    # ---- Quality filter: remove garbage signals ----
+    filtered = []
+    for s in signals:
+        if not _is_valid_signal(s):
+            continue
+        filtered.append(s)
+    signals = filtered
 
     # Group signals by business name
     grouped: dict[str, list[Signal]] = {}
