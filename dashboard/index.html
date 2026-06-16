@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEXUS — Deal Intelligence</title>
+<style>
+  :root {
+    --bg: #070b16; --panel: #0d1424; --panel2: #121a2e; --border: rgba(120,140,180,.14);
+    --text: #e8eef7; --muted: #8c9bb5; --faint: #5b6680;
+    --cyan: #2dd4ff; --cyan-dim: rgba(45,212,255,.12); --amber: #ffb020; --green: #34d399;
+    --red: #f87171; --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Inter', -apple-system, system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+  a { color: var(--cyan); text-decoration: none; }
+  .app { display: flex; min-height: 100vh; }
+
+  /* Sidebar nav */
+  nav { width: 210px; background: var(--panel); border-right: 1px solid var(--border); padding: 22px 0; position: fixed; height: 100vh; }
+  nav .brand { font-size: 19px; font-weight: 800; letter-spacing: .08em; padding: 0 22px 4px; color: var(--cyan); }
+  nav .tag { font-size: 10px; color: var(--faint); padding: 0 22px 22px; letter-spacing: .12em; text-transform: uppercase; }
+  nav a { display: block; padding: 11px 22px; color: var(--muted); font-weight: 500; border-left: 2px solid transparent; cursor: pointer; }
+  nav a:hover { background: var(--panel2); color: var(--text); }
+  nav a.active { color: var(--cyan); border-left-color: var(--cyan); background: var(--cyan-dim); }
+
+  main { margin-left: 210px; flex: 1; padding: 28px 34px; max-width: 1200px; }
+  h1 { font-size: 24px; font-weight: 700; margin-bottom: 4px; }
+  .eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; color: var(--cyan); font-weight: 700; }
+  .sub { color: var(--muted); margin-bottom: 22px; }
+  .page { display: none; }
+  .page.active { display: block; }
+
+  .grid { display: grid; gap: 16px; }
+  .cols-2 { grid-template-columns: repeat(2, 1fr); }
+  .cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .cols-4 { grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 900px) { .cols-2,.cols-3,.cols-4 { grid-template-columns: 1fr; } main { margin-left: 0; padding: 18px; } nav { display: none; } }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+  .card h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 12px; font-weight: 600; }
+
+  .stat { background: linear-gradient(135deg, var(--panel), var(--panel2)); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+  .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--faint); }
+  .stat .value { font-size: 28px; font-weight: 800; margin-top: 6px; }
+  .stat .value.cyan { color: var(--cyan); } .stat .value.amber { color: var(--amber); } .stat .value.green { color: var(--green); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  td { padding: 11px 10px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: var(--panel2); }
+
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+  .pill.cyan { background: var(--cyan-dim); color: var(--cyan); }
+  .pill.amber { background: rgba(255,176,32,.13); color: var(--amber); }
+  .pill.green { background: rgba(52,211,153,.13); color: var(--green); }
+  .pill.red { background: rgba(248,113,113,.13); color: var(--red); }
+  .pill.grade-A { background: rgba(52,211,153,.15); color: var(--green); }
+  .pill.grade-B { background: rgba(45,212,255,.15); color: var(--cyan); }
+  .pill.grade-C { background: rgba(255,176,32,.15); color: var(--amber); }
+  .pill.grade-D,.pill.grade-DECLINE { background: rgba(248,113,113,.15); color: var(--red); }
+
+  .score { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; height: 24px; border-radius: 6px; font-weight: 700; font-size: 12px; padding: 0 6px; }
+  .score.hot { background: rgba(248,113,113,.18); color: var(--red); }
+  .score.warm { background: rgba(255,176,32,.18); color: var(--amber); }
+  .score.cool { background: rgba(45,212,255,.15); color: var(--cyan); }
+
+  button, .btn { font-family: inherit; font-size: 13px; font-weight: 600; padding: 9px 15px; border-radius: 9px; border: 1px solid var(--border); background: var(--panel2); color: var(--text); cursor: pointer; }
+  button:hover, .btn:hover { border-color: var(--cyan); }
+  .btn.primary { background: var(--cyan); color: #04121c; border-color: var(--cyan); }
+  .btn.sm { padding: 5px 11px; font-size: 12px; }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+
+  label.field { display: block; margin-bottom: 12px; }
+  label.field .lbl { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  input, select, textarea { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; color: var(--text); font-family: inherit; font-size: 14px; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--cyan); }
+
+  .kanban { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; overflow-x: auto; }
+  .kcol { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px; min-width: 150px; }
+  .kcol h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 8px; display: flex; justify-content: space-between; }
+  .kcard { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 9px; margin-bottom: 8px; font-size: 12px; cursor: pointer; }
+  .kcard:hover { border-color: var(--cyan); }
+  .kcard .name { font-weight: 600; margin-bottom: 3px; }
+
+  .empty { text-align: center; padding: 30px; color: var(--faint); }
+  .toast { position: fixed; bottom: 22px; right: 22px; background: var(--panel2); border: 1px solid var(--cyan); border-radius: 10px; padding: 13px 18px; max-width: 320px; opacity: 0; transform: translateY(10px); transition: all .25s; z-index: 100; }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  pre { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+  .note { font-size: 12px; color: var(--faint); margin-top: 10px; }
+  .src-tier { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 700; }
+  .tier-A { background: rgba(52,211,153,.15); color: var(--green); }
+  .tier-B { background: rgba(45,212,255,.13); color: var(--cyan); }
+  .tier-C { background: rgba(140,155,181,.13); color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav>
+    <div class="brand">NEXUS</div>
+    <div class="tag">Deal Intelligence</div>
+    <a data-page="home" class="active">Morning Briefing</a>
+    <a data-page="signals">Signals</a>
+    <a data-page="pipeline">Pipeline</a>
+    <a data-page="qualify">Qualifier</a>
+    <a data-page="lenders">Lenders</a>
+    <a data-page="sources">Sources</a>
+  </nav>
+  <main>
+    <!-- HOME -->
+    <div class="page active" id="page-home">
+      <div class="eyebrow">Good morning</div>
+      <h1>Here's your day</h1>
+      <p class="sub">Signals to work, deals in motion, money in the pipeline.</p>
+      <div class="grid cols-4" id="home-stats"></div>
+      <div class="card" style="margin-top:18px">
+        <h3>Top signals to work today</h3>
+        <div id="home-signals"></div>
+      </div>
+    </div>
+
+    <!-- SIGNALS -->
+    <div class="page" id="page-signals">
+      <div class="eyebrow">Signal Engine</div>
+      <h1>Act Today</h1>
+      <p class="sub">Businesses showing capital-need signals, ranked by urgency. Run collectors to refresh.</p>
+      <div class="btn-row" style="margin-bottom:16px">
+        <button class="btn primary" onclick="runSignals()">Run all collectors</button>
+        <button class="btn" onclick="loadSignals()">Refresh list</button>
+      </div>
+      <div class="card"><div id="signals-list"></div></div>
+    </div>
+
+    <!-- PIPELINE -->
+    <div class="page" id="page-pipeline">
+      <div class="eyebrow">Pipeline</div>
+      <h1>Deals</h1>
+      <p class="sub">Drag deals through stages. Time-to-fund is tracked for your speed guarantee.</p>
+      <div class="kanban" id="kanban"></div>
+    </div>
+
+    <!-- QUALIFY -->
+    <div class="page" id="page-qualify">
+      <div class="eyebrow">Qualification</div>
+      <h1>Check Qualification</h1>
+      <p class="sub">The 8-question pre-screen. Instantly grades the deal and matches lenders.</p>
+      <div class="grid cols-2">
+        <div class="card">
+          <label class="field"><span class="lbl">Industry</span><input id="q-industry" placeholder="trucking, restaurant, HVAC..."></label>
+          <label class="field"><span class="lbl">Time in business (months)</span><input id="q-tib" type="number" value="24"></label>
+          <label class="field"><span class="lbl">Monthly revenue ($)</span><input id="q-rev" type="number" value="50000"></label>
+          <label class="field"><span class="lbl">Existing advances</span><select id="q-pos"><option value="0">None</option><option value="1">1</option><option value="2">2</option><option value="3">3+</option></select></label>
+          <label class="field"><span class="lbl">Amount needed ($)</span><input id="q-amt" type="number" value="50000"></label>
+        </div>
+        <div class="card">
+          <label class="field"><span class="lbl">Timeline</span><select id="q-time"><option>ASAP</option><option>1-2 weeks</option><option>this month</option><option>exploring</option></select></label>
+          <label class="field"><span class="lbl">Credit range</span><select id="q-credit"><option value="<550">Under 550</option><option value="550-600">550-600</option><option value="600-650">600-650</option><option value="650-700" selected>650-700</option><option value="700+">700+</option></select></label>
+          <label class="field"><span class="lbl">Revenue trend</span><select id="q-trend"><option value="growing">Growing</option><option value="flat">Flat</option><option value="declining">Declining</option></select></label>
+          <label class="field"><span class="lbl">NSFs per month</span><input id="q-nsf" type="number" value="1"></label>
+          <label class="field"><span class="lbl">Negative days per month</span><input id="q-neg" type="number" value="0"></label>
+          <button class="btn primary" onclick="runQualify()" style="width:100%">Qualify deal</button>
+        </div>
+      </div>
+      <div id="qual-result" style="margin-top:18px"></div>
+    </div>
+
+    <!-- LENDERS -->
+    <div class="page" id="page-lenders">
+      <div class="eyebrow">Lender Panel</div>
+      <h1>Your Lenders</h1>
+      <p class="sub">Your ISO relationships, their criteria, and your performance with each.</p>
+      <div class="card"><div id="lenders-list"></div></div>
+    </div>
+
+    <!-- SOURCES -->
+    <div class="page" id="page-sources">
+      <div class="eyebrow">Signal Sources</div>
+      <h1>Collectors</h1>
+      <p class="sub">All data sources feeding the signal engine. Add API keys to enable more.</p>
+      <div class="grid cols-3" id="sources-stats" style="margin-bottom:18px"></div>
+      <div class="card"><div id="sources-list"></div></div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const API = {
+  async get(u){ const r = await fetch(u); if(!r.ok) throw new Error((await r.json().catch(()=>({}))).detail||r.statusText); return r.json(); },
+  async post(u,b){ const r = await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}); if(!r.ok) throw new Error((await r.json().catch(()=>({}))).detail||r.statusText); return r.json(); },
+  async put(u,b){ const r = await fetch(u,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); if(!r.ok) throw new Error((await r.json().catch(()=>({}))).detail||r.statusText); return r.json(); },
+};
+function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2600); }
+function money(v){ return '$'+(Math.round(v||0)).toLocaleString(); }
+function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function scoreClass(s){ return s>=70?'hot':s>=45?'warm':'cool'; }
+
+// Nav
+document.querySelectorAll('nav a').forEach(a=>{
+  a.addEventListener('click',()=>{
+    document.querySelectorAll('nav a').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    a.classList.add('active');
+    document.getElementById('page-'+a.dataset.page).classList.add('active');
+    routes[a.dataset.page]?.();
+  });
+});
+
+// HOME
+async function pageHome(){
+  try {
+    const s = await API.get('/api/stats');
+    document.getElementById('home-stats').innerHTML = `
+      <div class="stat"><div class="label">Signals to work</div><div class="value cyan">${s.unworked_signals}</div></div>
+      <div class="stat"><div class="label">Active deals</div><div class="value">${s.total_deals}</div></div>
+      <div class="stat"><div class="label">Pending commission</div><div class="value amber">${money(s.pending_commission)}</div></div>
+      <div class="stat"><div class="label">Funded / commission</div><div class="value green">${money(s.total_commission)}</div></div>`;
+    const sig = await API.get('/api/signals/today?limit=8');
+    renderSignalRows(sig.signals, 'home-signals');
+  } catch(e){ toast('Load failed: '+e.message); }
+}
+
+// SIGNALS
+async function loadSignals(){
+  try { const d = await API.get('/api/signals/today?limit=40'); renderSignalRows(d.signals,'signals-list'); }
+  catch(e){ toast(e.message); }
+}
+function renderSignalRows(signals, target){
+  const host = document.getElementById(target);
+  if(!signals.length){ host.innerHTML = '<div class="empty">No signals yet. Run the collectors to find businesses showing capital-need signals.</div>'; return; }
+  host.innerHTML = `<table><thead><tr><th>Score</th><th>Business</th><th>Signal</th><th>Source</th><th></th></tr></thead><tbody>`+
+    signals.map(s=>`<tr>
+      <td><span class="score ${scoreClass(s.score)}">${s.score}</span></td>
+      <td><strong>${esc(s.business_name)}</strong>${s.location?`<br><span style="color:var(--faint);font-size:12px">${esc(s.location)}</span>`:''}</td>
+      <td><span class="pill cyan">${esc(s.signal_type)}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(s.source)}</td>
+      <td><button class="btn sm primary" onclick="convertSignal('${s.id}')">→ Deal</button>
+          <button class="btn sm" onclick="dismissSignal('${s.id}')">Dismiss</button></td>
+    </tr>`).join('')+`</tbody></table>`;
+}
+async function runSignals(){
+  toast('Running collectors...');
+  try { const r = await API.post('/api/signals/run',{}); toast(`${r.collectors_run} collectors ran · ${r.new_signals_stored} new signals`); loadSignals(); }
+  catch(e){ toast(e.message); }
+}
+async function convertSignal(id){ try{ await API.post(`/api/signals/${id}/convert`,{}); toast('Converted to deal'); loadSignals(); }catch(e){toast(e.message);} }
+async function dismissSignal(id){ try{ await API.put(`/api/signals/${id}/dismiss`); loadSignals(); }catch(e){toast(e.message);} }
+
+// PIPELINE
+const STAGES = ["Signal","Contacted","Qualifying","Submitted","Approved","Funded","Lost"];
+async function pagePipeline(){
+  try {
+    const d = await API.get('/api/deals');
+    const byStage = {}; STAGES.forEach(s=>byStage[s]=[]);
+    d.deals.forEach(x=>(byStage[x.stage]||byStage['Signal']).push(x));
+    document.getElementById('kanban').innerHTML = STAGES.map(st=>`
+      <div class="kcol"><h4>${st}<span>${byStage[st].length}</span></h4>
+        ${byStage[st].map(x=>`<div class="kcard" onclick="cycleStage('${x.id}','${x.stage}')">
+          <div class="name">${esc(x.business_name)}</div>
+          ${x.paper_grade?`<span class="pill grade-${x.paper_grade}">${x.paper_grade}</span> `:''}
+          ${x.estimated_commission?`<span style="color:var(--amber);font-size:11px">${money(x.estimated_commission)}</span>`:''}
+        </div>`).join('')}
+      </div>`).join('');
+  } catch(e){ toast(e.message); }
+}
+async function cycleStage(id, current){
+  const idx = STAGES.indexOf(current);
+  const next = STAGES[Math.min(idx+1, STAGES.length-2)];
+  try { await API.put(`/api/deals/${id}/stage`,{stage:next}); toast('Moved to '+next); pagePipeline(); }
+  catch(e){ toast(e.message); }
+}
+
+// QUALIFY
+async function runQualify(){
+  const body = {
+    industry: document.getElementById('q-industry').value,
+    time_in_business_months: +document.getElementById('q-tib').value,
+    monthly_revenue: +document.getElementById('q-rev').value,
+    existing_positions: +document.getElementById('q-pos').value,
+    amount_requested: +document.getElementById('q-amt').value,
+    timeline: document.getElementById('q-time').value,
+    credit_range: document.getElementById('q-credit').value,
+    revenue_trend: document.getElementById('q-trend').value,
+    nsf_count: +document.getElementById('q-nsf').value,
+    negative_days: +document.getElementById('q-neg').value,
+  };
+  try {
+    const r = await API.post('/api/qualify', body);
+    const host = document.getElementById('qual-result');
+    if(!r.qualified){
+      host.innerHTML = `<div class="card" style="border-color:var(--red)">
+        <h3 style="color:var(--red)">Does not qualify</h3>
+        ${r.disqualifiers.map(x=>`<div style="color:var(--red);margin:4px 0">✕ ${esc(x)}</div>`).join('')}
+        <div class="note">Don't submit this — it would burn lender goodwill. Address the issues or pass.</div></div>`;
+      return;
+    }
+    host.innerHTML = `<div class="grid cols-2">
+      <div class="card">
+        <h3>Result</h3>
+        <div style="font-size:32px;font-weight:800">Grade <span class="pill grade-${r.paper_grade}" style="font-size:24px;padding:4px 14px">${r.paper_grade}</span></div>
+        <div style="margin-top:12px;color:var(--muted)">Qualification score: <strong style="color:var(--text)">${r.qual_score}/100</strong></div>
+        <div style="margin-top:6px;color:var(--muted)">Estimated: <strong style="color:var(--cyan)">${money(r.estimated_amount.low)}–${money(r.estimated_amount.high)}</strong></div>
+        <div style="margin-top:6px;color:var(--muted)">Factor range: <strong style="color:var(--text)">${r.estimated_factor}</strong></div>
+        <div style="margin-top:12px">${r.reasons.map(x=>`<div style="color:var(--green);font-size:13px">✓ ${esc(x)}</div>`).join('')}</div>
+      </div>
+      <div class="card">
+        <h3>Recommended lenders</h3>
+        ${(r.lender_matches||[]).map(m=>`<div style="padding:10px 0;border-bottom:1px solid var(--border)">
+          <div style="display:flex;justify-content:space-between"><strong>${esc(m.lender_name)}</strong><span class="score ${scoreClass(m.match_score)}">${m.match_score}</span></div>
+          <div style="font-size:12px;color:var(--muted)">Est. commission ${money(m.estimated_commission)} · ${m.commission_pct}% ${m.funds_same_day?'· same-day':''}</div>
+          ${m.reasons.length?`<div style="font-size:11px;color:var(--faint);margin-top:2px">${m.reasons.join(' · ')}</div>`:''}
+        </div>`).join('')}
+      </div></div>`;
+  } catch(e){ toast(e.message); }
+}
+
+// LENDERS
+async function pageLenders(){
+  try {
+    const d = await API.get('/api/lenders');
+    document.getElementById('lenders-list').innerHTML = `<table><thead><tr><th>Lender</th><th>Grades</th><th>Min Rev</th><th>Commission</th><th>Speed</th><th>Approval rate</th></tr></thead><tbody>`+
+      d.lenders.map(L=>`<tr>
+        <td><strong>${esc(L.name)}</strong><br><span style="font-size:11px;color:var(--faint)">${esc(L.notes||'')}</span></td>
+        <td>${L.paper_grades.map(g=>`<span class="pill grade-${g.toUpperCase()}">${g.toUpperCase()}</span>`).join(' ')}</td>
+        <td>${money(L.min_revenue)}/mo</td>
+        <td><span class="pill amber">${L.commission_pct}%</span></td>
+        <td>${L.funds_same_day?'<span class="pill green">same-day</span>':'—'}</td>
+        <td>${L.submissions?Math.round(L.approval_rate*100)+'%':'<span style="color:var(--faint)">no data</span>'}</td>
+      </tr>`).join('')+`</tbody></table>`;
+  } catch(e){ toast(e.message); }
+}
+
+// SOURCES
+async function pageSources(){
+  try {
+    const d = await API.get('/api/signals/sources');
+    document.getElementById('sources-stats').innerHTML = `
+      <div class="stat"><div class="label">Total collectors</div><div class="value cyan">${d.total_collectors}</div></div>
+      <div class="stat"><div class="label">Enabled now</div><div class="value green">${d.enabled}</div></div>
+      <div class="stat"><div class="label">Need API key</div><div class="value amber">${d.disabled_missing_key}</div></div>`;
+    document.getElementById('sources-list').innerHTML = `<table><thead><tr><th>Tier</th><th>Source</th><th>Type</th><th>Schedule</th><th>Status</th></tr></thead><tbody>`+
+      d.collectors.map(c=>`<tr>
+        <td><span class="src-tier tier-${c.tier}">${c.tier}</span></td>
+        <td><strong>${esc(c.name)}</strong><br><span style="font-size:11px;color:var(--faint)">${esc(c.description)}</span></td>
+        <td style="font-size:12px;color:var(--muted)">${c.source_type}</td>
+        <td style="font-size:12px;color:var(--muted)">${c.schedule}</td>
+        <td>${c.enabled?'<span class="pill green">on</span>':`<span class="pill red">key: ${c.requires_key||'?'}</span>`}</td>
+      </tr>`).join('')+`</tbody></table>`;
+  } catch(e){ toast(e.message); }
+}
+
+const routes = { home: pageHome, signals: loadSignals, pipeline: pagePipeline, qualify: ()=>{}, lenders: pageLenders, sources: pageSources };
+pageHome();
+</script>
+</body>
+</html>
