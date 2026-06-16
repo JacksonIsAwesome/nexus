@@ -1004,7 +1004,7 @@ DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard")
 if os.path.isdir(DASHBOARD_DIR):
     @app.get("/")
     def root():
-        return JSONResponse({"app": APP_NAME, "dashboard": "/dashboard/"})
+        from fastapi.responses import RedirectResponse; return RedirectResponse("/dashboard/")
     app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard")
 
 
