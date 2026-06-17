@@ -1781,6 +1781,96 @@ def build_registry() -> list[Collector]:
 # SCORING ENGINE
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# Job title classifier — scores job postings by how strongly the TITLE predicts
+# a real, ROI-positive capital need (revenue-generating roles score highest)
+# ---------------------------------------------------------------------------
+
+# Revenue-generating / capital-intensive roles → strong capital-need signal
+_HIGH_VALUE_TITLES = {
+    # Trucking / logistics (capital-intensive, fuel + equipment + payroll gaps)
+    "cdl driver": 30, "truck driver": 30, "owner operator": 28, "dispatcher": 18,
+    "diesel mechanic": 24, "fleet": 22,
+    # Skilled trades (high revenue per head, growth = equipment + payroll)
+    "hvac": 28, "hvac technician": 30, "plumber": 28, "electrician": 28,
+    "journeyman": 26, "pipefitter": 26, "welder": 24, "roofer": 24,
+    "mason": 22, "carpenter": 22, "installer": 22,
+    # Medical / dental (very high revenue per head, equipment heavy)
+    "dental hygienist": 28, "dentist": 30, "physician": 30, "nurse practitioner": 26,
+    "physical therapist": 28, "veterinarian": 30, "optometrist": 28, "chiropractor": 26,
+    "dental assistant": 20, "medical assistant": 18, "registered nurse": 22,
+    # Sales / revenue roles (direct revenue generation)
+    "sales representative": 25, "sales manager": 26, "account executive": 25,
+    "business development": 24, "outside sales": 26,
+    # Construction / contracting (project capital needs)
+    "project manager": 22, "estimator": 22, "foreman": 22, "superintendent": 22,
+    "heavy equipment operator": 24, "crane operator": 24,
+    # Manufacturing / production (capacity expansion)
+    "machinist": 22, "cnc": 22, "production manager": 20, "fabricator": 22,
+    # Food service at scale (expansion signal)
+    "kitchen manager": 18, "line cook": 14, "restaurant manager": 18, "chef": 18,
+}
+
+# Support / overhead roles → weak signal (not direct revenue, less urgent capital need)
+_LOW_VALUE_TITLES = {
+    "administrative assistant": 5, "receptionist": 5, "office manager": 6,
+    "data entry": 4, "intern": 3, "customer service": 8, "front desk": 5,
+    "bookkeeper": 7, "human resources": 6, "social media": 6, "marketing coordinator": 8,
+    "video editing": 3, "graphic designer": 6, "content writer": 5,
+}
+
+
+def classify_job_title(title: str) -> dict:
+    """
+    Score a job title 0-30 by how strongly it predicts a real, ROI-positive
+    capital need. Revenue-generating and capital-intensive roles score high;
+    overhead/support roles score low.
+    """
+    t = (title or "").lower().strip()
+    if not t:
+        return {"score": 10, "category": "unknown", "reason": "no title"}
+
+    # Check high-value titles (longest match wins for specificity)
+    best_high = 0
+    best_high_key = ""
+    for key, score in _HIGH_VALUE_TITLES.items():
+        if key in t and score > best_high:
+            best_high = score
+            best_high_key = key
+
+    # Check low-value titles
+    best_low = 0
+    best_low_key = ""
+    for key, score in _LOW_VALUE_TITLES.items():
+        if key in t and (best_low == 0 or score < best_low):
+            best_low = score
+            best_low_key = key
+
+    if best_high:
+        return {"score": best_high, "category": "revenue_generating",
+                "reason": f"'{best_high_key}' is a revenue-generating/capital-intensive role", "matched": best_high_key}
+    if best_low:
+        return {"score": best_low, "category": "overhead",
+                "reason": f"'{best_low_key}' is an overhead role — weaker capital-need signal", "matched": best_low_key}
+
+    return {"score": 12, "category": "neutral", "reason": "title not classified", "matched": ""}
+
+
+def score_hiring_signal(sig: Signal) -> float:
+    """
+    Re-score a hiring signal using the job title classifier.
+    Pulls the title from raw_data if available.
+    """
+    raw = sig.raw_data or {}
+    title = raw.get("job_title") or raw.get("title") or ""
+    if not title:
+        # Fall back to default strength if no title to classify
+        return sig.strength
+    cls = classify_job_title(title)
+    # Blend: base 15 + title score (capped at 40)
+    return min(15 + cls["score"], 40)
+
+
 # Base signal strength weights by signal_type (0-40 scale)
 SIGNAL_WEIGHTS: dict[str, float] = {
     "gov_contract_award": 35,
@@ -2024,3 +2114,102 @@ def registry_stats() -> dict:
         "by_source_type": by_type,
         "collectors": [c.status() for c in collectors],
     }
+
+
+# ===========================================================================
+# ENRICHMENT PIPELINE
+# Turns a raw signal (name + location) into a pre-call dossier by looking up
+# public data: business age, estimated revenue, existing MCA, owner contact.
+# ===========================================================================
+
+def enrich_business(business_name: str, location: str = "", website: str = "",
+                    raw_data: dict = None) -> dict:
+    """
+    Build a pre-call dossier for a business. Each lookup degrades gracefully —
+    a failed lookup just leaves that field empty rather than blocking the others.
+
+    Returns a dict with whatever could be found:
+      - estimated_tib_months (from any incorporation date in raw_data)
+      - estimated_monthly_revenue (from review count, employee count heuristics)
+      - has_existing_mca (from UCC hints if available)
+      - owner_name, owner_linkedin, phone, email, website
+      - enrichment_notes (what was found / not found)
+    """
+    raw = raw_data or {}
+    dossier = {
+        "business_name": business_name,
+        "location": location,
+        "estimated_tib_months": None,
+        "estimated_monthly_revenue": None,
+        "revenue_basis": "",
+        "has_existing_mca": None,
+        "owner_name": "",
+        "owner_linkedin": "",
+        "phone": raw.get("phone", "") or (raw.get("contact_hints", {}) or {}).get("phone", ""),
+        "email": "",
+        "website": website,
+        "enrichment_notes": [],
+        "enriched_at": _now().isoformat(),
+    }
+
+    # --- Business age from incorporation date if present in signal raw_data ---
+    inc_date = raw.get("incorporation_date") or raw.get("file_date") or raw.get("sale_date")
+    if inc_date:
+        try:
+            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
+                try:
+                    d = datetime.strptime(str(inc_date)[:10], fmt)
+                    months = max(0, int((_now().replace(tzinfo=None) - d).days / 30))
+                    dossier["estimated_tib_months"] = months
+                    dossier["enrichment_notes"].append(f"Business age ~{months} months (from filing date)")
+                    break
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+
+    # --- Estimated revenue from review count (rough heuristic) ---
+    review_count = raw.get("review_count") or raw.get("total_ratings") or 0
+    if review_count and int(review_count) > 0:
+        rc = int(review_count)
+        # Very rough: more reviews ~ more volume. Industry-dependent, so wide bands.
+        if rc > 500:
+            est_rev = 150000
+        elif rc > 200:
+            est_rev = 90000
+        elif rc > 100:
+            est_rev = 60000
+        elif rc > 50:
+            est_rev = 40000
+        else:
+            est_rev = 25000
+        dossier["estimated_monthly_revenue"] = est_rev
+        dossier["revenue_basis"] = f"~{rc} reviews (rough proxy)"
+        dossier["enrichment_notes"].append(f"Est. revenue ${est_rev:,}/mo based on {rc} reviews (very rough)")
+
+    # --- Job count as a growth proxy ---
+    job_count = raw.get("job_count") or raw.get("posting_count") or 0
+    if job_count and int(job_count) >= 2:
+        dossier["enrichment_notes"].append(f"{job_count} simultaneous job postings — active growth")
+
+    # --- Existing MCA hint (would come from UCC collector when active) ---
+    if raw.get("ucc_filing") or raw.get("existing_mca"):
+        dossier["has_existing_mca"] = True
+        dossier["enrichment_notes"].append("UCC filing detected — likely existing MCA position")
+
+    # --- Contract award = strong fundability signal ---
+    if raw.get("amount") or raw.get("award_amount"):
+        amt = raw.get("amount") or raw.get("award_amount")
+        dossier["enrichment_notes"].append(f"Recent contract/award: ${amt} — strong fulfillment-capital need")
+
+    if not dossier["enrichment_notes"]:
+        dossier["enrichment_notes"].append("Limited public data available — manual research recommended before outreach")
+
+    return dossier
+
+
+def enrichment_completeness(dossier: dict) -> int:
+    """Score 0-100 how complete the dossier is (how ready for a call)."""
+    fields = ["estimated_tib_months", "estimated_monthly_revenue", "phone", "website", "owner_name"]
+    have = sum(1 for f in fields if dossier.get(f))
+    return round((have / len(fields)) * 100)

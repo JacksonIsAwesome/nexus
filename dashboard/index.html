@@ -131,7 +131,9 @@
       <div class="btn-row" style="margin-bottom:16px">
         <button class="btn primary" onclick="runSignals()">Run all collectors</button>
         <button class="btn" onclick="loadSignals()">Refresh list</button>
+        <button class="btn" onclick="runBrainReview()" style="border-color:var(--purple);color:var(--purple)">🧠 Claude deep-dive (top 10)</button>
       </div>
+      <div id="brain-summary"></div>
       <div class="card"><div id="signals-list"></div></div>
     </div>
 
@@ -318,6 +320,49 @@ async function runSignals(){
 }
 async function convertSignal(id){ try{ await API.post(`/api/signals/${id}/convert`,{}); toast('Converted to deal'); loadSignals(); }catch(e){toast(e.message);} }
 async function dismissSignal(id){ try{ await API.put(`/api/signals/${id}/dismiss`); loadSignals(); }catch(e){toast(e.message);} }
+
+// META BRAIN — Claude deep-dive
+async function runBrainReview(){
+  toast('Claude is reviewing your top signals...');
+  const summaryHost = document.getElementById('brain-summary');
+  summaryHost.innerHTML = '<div class="card" style="border-color:var(--purple)"><div class="empty">🧠 Claude is analyzing the top 10 signals with full context...</div></div>';
+  try{
+    const r = await API.post('/api/brain/review',{limit:10});
+    if(r.error){
+      summaryHost.innerHTML = `<div class="card" style="border-color:var(--amber)"><div class="note" style="color:var(--amber)">${esc(r.error)}</div></div>`;
+      return;
+    }
+    const s = r.summary;
+    summaryHost.innerHTML = `<div class="card" style="border-color:var(--purple);margin-bottom:14px">
+      <h3 style="color:var(--purple)">🧠 Claude's verdict on your top ${s.reviewed} signals</h3>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin:10px 0">
+        <span><b style="color:var(--green);font-size:20px">${s.strong}</b> strong</span>
+        <span><b style="color:var(--cyan);font-size:20px">${s.maybe}</b> maybe</span>
+        <span><b style="color:var(--muted);font-size:20px">${s.weak}</b> weak</span>
+        <span><b style="color:var(--red);font-size:20px">${s.avoid}</b> avoid</span>
+        ${s.ethical_flags?`<span><b style="color:var(--amber);font-size:20px">⚠ ${s.ethical_flags}</b> ethical flags</span>`:''}
+      </div>
+      ${r.verdicts.map(v=>{
+        const vc = v.verdict==='strong'?'var(--green)':v.verdict==='maybe'?'var(--cyan)':v.verdict==='avoid'?'var(--red)':'var(--muted)';
+        const check = v.legit_need?'✓':'✕';
+        return `<div style="padding:12px 0;border-bottom:1px solid var(--border)">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span><b style="color:${vc};font-size:16px">${check}</b> <strong>${esc(v.business_name)}</strong>
+              <span class="pill" style="background:rgba(167,139,250,.13);color:var(--purple)">${esc(v.verdict)}</span>
+              <span style="color:var(--faint);font-size:12px">conf ${v.confidence}</span></span>
+            <span class="pill ${v.suggested_product==='sba'?'green':'cyan'}">${esc(v.suggested_product)}</span>
+          </div>
+          <div style="font-size:13px;color:var(--muted);margin-top:5px">${esc(v.reasoning)}</div>
+          ${v.ethical_flag?`<div style="font-size:12px;color:var(--amber);margin-top:3px">⚠ ${esc(v.ethical_flag)}</div>`:''}
+          ${v.outreach_angle&&v.verdict!=='avoid'?`<div style="font-size:12px;color:var(--cyan);margin-top:3px">→ ${esc(v.outreach_angle)}</div>`:''}
+        </div>`;
+      }).join('')}
+    </div>`;
+    toast(`Claude reviewed ${s.reviewed}: ${s.strong} strong, ${s.avoid} to avoid`);
+  }catch(e){
+    summaryHost.innerHTML = `<div class="card" style="border-color:var(--red)"><div class="note" style="color:var(--red)">${esc(e.message)}</div></div>`;
+  }
+}
 
 // PIPELINE
 const STAGES = ["Signal","Contacted","Qualifying","Submitted","Approved","Funded","Lost"];

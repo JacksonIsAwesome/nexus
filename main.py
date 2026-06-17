@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 import collectors as signal_engine
 
 APP_NAME = "NEXUS Deal Intelligence Engine"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -234,6 +234,9 @@ class SignalRecord(Base):
     dedup_key = Column(String, default="")
     worked = Column(Boolean, default=False)            # have you acted on it?
     converted_to_deal = Column(String, default="")     # deal id if converted
+    brain_verdict = Column(String, default="")         # strong|maybe|weak|avoid
+    brain_legit = Column(Boolean, default=False)       # Claude's legit-need checkmark
+    brain_reasoning = Column(Text, default="")         # Claude's reasoning
     created_at = Column(DateTime, default=_now)
 
     def to_dict(self) -> dict:
@@ -251,6 +254,9 @@ class SignalRecord(Base):
             "source_url": self.source_url, "raw_data": raw, "contact_hints": hints,
             "dedup_key": self.dedup_key, "worked": self.worked,
             "converted_to_deal": self.converted_to_deal,
+            "brain_verdict": self.brain_verdict or "",
+            "brain_legit": bool(self.brain_legit),
+            "brain_reasoning": self.brain_reasoning or "",
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -940,6 +946,180 @@ def signals_today(limit: int = 20, db: Session = Depends(get_db)):
     stmt = select(SignalRecord).where(SignalRecord.worked == False).order_by(SignalRecord.score.desc()).limit(limit)
     sigs = db.execute(stmt).scalars().all()
     return {"count": len(sigs), "signals": [s.to_dict() for s in sigs]}
+
+
+# ===========================================================================
+# THE META BRAIN — Claude reviews top signals with full context and gives a
+# verdict on whether each represents a legitimate, ethical, fundable need.
+# ===========================================================================
+
+NEXUS_BRAIN_SYSTEM_PROMPT = """You are the analytical brain inside NEXUS, a deal-intelligence engine built by an independent RBF/MCA (Revenue-Based Financing / Merchant Cash Advance) broker operating in Minnesota. Your job is to review business "signals" — events detected from public data that might indicate a business needs working capital — and decide which ones represent a LEGITIMATE, ETHICAL, and FUNDABLE capital need worth pursuing.
+
+== WHAT THE BUSINESS IS ==
+The operator is an ISO (Independent Sales Organization) / broker. They find small businesses that need working capital, qualify them, and connect them to lenders (MCA funders for fast cash, or SBA lenders for cheaper capital when the merchant qualifies). The broker earns a commission (typically 5-15% of the funded amount for MCA, 1-2% for SBA) when a deal funds. The broker wants to build a durable, ethical, relationship-based business — NOT churn-and-burn predatory lending.
+
+== WHAT MAKES A GOOD SIGNAL (fund-worthy) ==
+The IDEAL candidate is a business that needs capital for something that will GENERATE MORE than it costs — capital that grows the business, not bails it out. Specifically:
+- Won a contract and needs capital to fulfill it (self-liquidating, guaranteed future revenue) — BEST
+- Hiring revenue-generating roles (CDL drivers, HVAC techs, dental hygienists, sales reps) — growth that's cash-constrained
+- Expanding (new location, new equipment, signed a bigger lease) — growth capital need
+- Seasonal business approaching its known cash-crunch window (landscaping before spring, retail before Q4)
+- Established (12+ months), steady or growing revenue, in a fundable industry (trucking, trades, medical, restaurants, retail, construction, e-commerce)
+
+== WHAT MAKES A BAD SIGNAL (avoid) ==
+- Business that's clearly DECLINING and would borrow just to survive (MCA would accelerate their failure)
+- Already drowning in debt / stacked with multiple MCAs (adding more is predatory)
+- Capital need is to pay off OTHER debt (debt spiral)
+- Restricted industries (adult, gambling, firearms, cannabis, pure nonprofits)
+- Too new (under 6 months) or too small (under ~$10K/month revenue) to responsibly fund
+- The "signal" is actually just noise — a generic product name, a news headline that isn't a real business, a parsing artifact
+
+== THE ETHICAL TEST ==
+For each signal, apply this test: "If this business owner were my family member, would I tell them to pursue capital right now?" If the honest answer is no — because they'd be borrowing to survive, stacking unaffordable debt, or the signal suggests distress rather than growth — then it is NOT a good lead, no matter how "motivated" they might be. Predatory deals destroy the broker's reputation and hurt real people. Flag these clearly.
+
+Also consider: would this merchant be better served by a CHEAPER product (SBA loan, credit union, CDFI microloan) than an MCA? If they look established and not in a rush, note that SBA may be the ethical primary option.
+
+== YOUR OUTPUT ==
+For each signal you review, return a JSON object with:
+- "verdict": one of "strong" (legit fundable need, pursue), "maybe" (worth a look but needs qualification), "weak" (low-quality signal, deprioritize), or "avoid" (distress/predatory/noise — do not pursue)
+- "legit_need": boolean — is this a genuine, ethical capital need worth a broker's time?
+- "confidence": 0-100
+- "reasoning": 1-3 sentences, specific and honest, explaining the verdict
+- "ethical_flag": string or null — if there's an ethical concern (distress borrowing, possible stacking, predatory risk), name it; otherwise null
+- "suggested_product": "mca" | "sba" | "term_loan" | "none" — what product likely fits best
+- "outreach_angle": one sentence — if pursuing, what's the specific, relevant hook for the first conversation (tied to WHY they need capital now)
+
+Be skeptical. Most signals are mediocre. Reserve "strong" for genuinely good opportunities. Catch the outliers — both the hidden gems (a great fundable business buried in the list) and the traps (a distressed business that looks tempting but shouldn't be funded). Honesty over optimism. You are protecting the operator's reputation and the merchants' wellbeing, not just chasing commissions."""
+
+
+class BrainReviewInput(BaseModel):
+    limit: int = 10
+    signal_ids: list[str] = Field(default_factory=list)  # specific signals, or top N if empty
+
+
+@app.post("/api/brain/review")
+def brain_review(payload: BrainReviewInput, db: Session = Depends(get_db)):
+    """
+    The meta-brain: Claude does a deep dive on the top signals with full context
+    and returns a verdict + checkmark for each. Requires ANTHROPIC_API_KEY.
+    """
+    if not ANTHROPIC_API_KEY:
+        return {"error": "ANTHROPIC_API_KEY not configured. Add it in Railway to enable the meta-brain.",
+                "claude_available": False}
+
+    # Gather the signals to review
+    if payload.signal_ids:
+        sigs = [db.get(SignalRecord, sid) for sid in payload.signal_ids]
+        sigs = [s for s in sigs if s]
+    else:
+        stmt = select(SignalRecord).where(SignalRecord.worked == False).order_by(
+            SignalRecord.score.desc()).limit(payload.limit)
+        sigs = db.execute(stmt).scalars().all()
+
+    if not sigs:
+        return {"error": "No signals to review. Run the collectors first.", "reviewed": 0}
+
+    # Build the context payload for Claude
+    signal_context = []
+    for s in sigs:
+        try:
+            raw = json.loads(s.raw_data or "{}")
+        except (ValueError, TypeError):
+            raw = {}
+        # Enrich each before review
+        dossier = signal_engine.enrich_business(s.business_name, s.location, raw_data=raw)
+        signal_context.append({
+            "signal_id": s.id,
+            "business_name": s.business_name,
+            "location": s.location,
+            "signal_type": s.signal_type,
+            "source": s.source,
+            "nexus_score": s.score,
+            "raw_data": raw,
+            "enrichment": {
+                "estimated_tib_months": dossier["estimated_tib_months"],
+                "estimated_monthly_revenue": dossier["estimated_monthly_revenue"],
+                "has_existing_mca": dossier["has_existing_mca"],
+                "notes": dossier["enrichment_notes"],
+            },
+        })
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        user_msg = (
+            "Review these signals and return a JSON array (one object per signal, in the same order). "
+            "Each object must have exactly these keys: signal_id, verdict, legit_need, confidence, "
+            "reasoning, ethical_flag, suggested_product, outreach_angle.\n\n"
+            "Return ONLY the JSON array, no markdown fences, no preamble.\n\n"
+            f"SIGNALS TO REVIEW:\n{json.dumps(signal_context, indent=2)}"
+        )
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4000,
+            system=NEXUS_BRAIN_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        text = text.strip("`").strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+        verdicts = json.loads(text)
+    except Exception as e:
+        return {"error": f"Claude review failed: {e}", "claude_available": True}
+
+    # Merge verdicts back with the signal data and persist the verdict
+    by_id = {v.get("signal_id"): v for v in verdicts}
+    results = []
+    for s in sigs:
+        v = by_id.get(s.id, {})
+        # Store the verdict on the signal record
+        s.brain_verdict = v.get("verdict", "")
+        s.brain_legit = bool(v.get("legit_need", False))
+        s.brain_reasoning = v.get("reasoning", "")
+        results.append({
+            "signal_id": s.id,
+            "business_name": s.business_name,
+            "signal_type": s.signal_type,
+            "nexus_score": s.score,
+            "verdict": v.get("verdict", "unknown"),
+            "legit_need": v.get("legit_need", False),
+            "confidence": v.get("confidence", 0),
+            "reasoning": v.get("reasoning", ""),
+            "ethical_flag": v.get("ethical_flag"),
+            "suggested_product": v.get("suggested_product", "none"),
+            "outreach_angle": v.get("outreach_angle", ""),
+        })
+    db.commit()
+
+    # Summary stats
+    summary = {
+        "reviewed": len(results),
+        "strong": sum(1 for r in results if r["verdict"] == "strong"),
+        "maybe": sum(1 for r in results if r["verdict"] == "maybe"),
+        "weak": sum(1 for r in results if r["verdict"] == "weak"),
+        "avoid": sum(1 for r in results if r["verdict"] == "avoid"),
+        "ethical_flags": sum(1 for r in results if r["ethical_flag"]),
+    }
+    # Sort: strong first, then by confidence
+    order = {"strong": 0, "maybe": 1, "weak": 2, "avoid": 3, "unknown": 4}
+    results.sort(key=lambda r: (order.get(r["verdict"], 4), -r["confidence"]))
+    return {"summary": summary, "verdicts": results}
+
+
+@app.get("/api/enrich/{signal_id}")
+def enrich_signal(signal_id: str, db: Session = Depends(get_db)):
+    """Build a pre-call dossier for a single signal."""
+    s = db.get(SignalRecord, signal_id)
+    if not s:
+        raise HTTPException(404, "Signal not found")
+    try:
+        raw = json.loads(s.raw_data or "{}")
+    except (ValueError, TypeError):
+        raw = {}
+    dossier = signal_engine.enrich_business(s.business_name, s.location, raw_data=raw)
+    dossier["completeness"] = signal_engine.enrichment_completeness(dossier)
+    return dossier
 
 
 @app.post("/api/signals/{signal_id}/convert")
