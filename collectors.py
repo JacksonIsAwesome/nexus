@@ -377,43 +377,56 @@ class GooglePlacesChanges(Collector):
         return signals
 
 
-# ---- 7. Yelp Business Activity ----
-class YelpActivity(Collector):
-    name = "yelp_activity"
-    description = "Yelp review velocity — businesses with sudden review spikes are growing fast"
+# ---- 7. Foursquare Places — New / Active Businesses ----
+class FoursquareActivity(Collector):
+    name = "foursquare_places"
+    description = "Foursquare Places API — active local businesses, new openings, review velocity"
     source_type = "api"
     schedule = "weekly"
-    requires_key = "YELP_API_KEY"
+    requires_key = "FOURSQUARE_API_KEY"
     tier = "B"
-    default_strength = 18.0
+    default_strength = 20.0
 
     def collect(self, **kwargs) -> list[Signal]:
-        key = os.getenv("YELP_API_KEY", "").strip()
+        key = os.getenv("FOURSQUARE_API_KEY", "").strip()
         if not key:
             return []
         signals = []
         location = kwargs.get("location", "Minneapolis, MN")
-        categories = kwargs.get("categories", ["contractors", "restaurants", "auto", "landscaping"])
-        for cat in categories[:4]:
-            resp = self._get("https://api.yelp.com/v3/businesses/search", params={
-                "location": location, "categories": cat, "sort_by": "review_count", "limit": 10,
-            }, headers={"Authorization": f"Bearer {key}"})
+        # Foursquare Places API v3 — free 1,000 req/hour
+        categories = [
+            ("17000", "food"),           # Food & Dining
+            ("11000", "professional"),   # Professional Services
+            ("12000", "retail"),         # Retail
+            ("15000", "travel"),         # Travel & Transport
+        ]
+        for cat_id, cat_name in categories[:3]:
+            resp = self._get(
+                "https://api.foursquare.com/v3/places/search",
+                params={"near": location, "categories": cat_id, "limit": 15, "sort": "RATING"},
+                headers={"Authorization": key, "Accept": "application/json"},
+            )
             if not resp:
                 continue
-            for biz in (resp.json().get("businesses") or []):
-                rc = biz.get("review_count", 0)
-                if rc > 50:  # established business
-                    signals.append(Signal(
-                        business_name=biz.get("name", ""),
-                        location=", ".join(biz.get("location", {}).get("display_address", [])),
-                        signal_type="high_review_activity",
-                        strength=self.default_strength + min(rc // 50, 10),
-                        source=self.name,
-                        source_url=biz.get("url", ""),
-                        raw_data={"review_count": rc, "rating": biz.get("rating"), "category": cat},
-                        contact_hints={"phone": biz.get("phone", "")},
-                    ))
-        _log(self.name, f"found {len(signals)} Yelp signals")
+            for place in (resp.json().get("results") or []):
+                name = place.get("name", "")
+                geocode = (place.get("geocodes") or {}).get("main") or {}
+                addr_parts = place.get("location") or {}
+                addr = ", ".join(filter(None, [addr_parts.get("address"), addr_parts.get("locality"), addr_parts.get("region")]))
+                stats = place.get("stats") or {}
+                if not name:
+                    continue
+                signals.append(Signal(
+                    business_name=name,
+                    location=addr or location,
+                    signal_type="active_local_business",
+                    strength=self.default_strength,
+                    source=self.name,
+                    raw_data={"category": cat_name, "total_photos": stats.get("total_photos", 0),
+                              "total_ratings": stats.get("total_ratings", 0)},
+                    contact_hints={"address": addr},
+                ))
+        _log(self.name, f"found {len(signals)} Foursquare signals")
         return signals
 
 
@@ -1478,29 +1491,44 @@ class ThumbTackPros(Collector):
         return signals
 
 
-# ---- 63. Yelp "New Business" Filter ----
-class YelpNewBusinesses(Collector):
-    name = "yelp_new_businesses"
-    description = "Recently opened businesses on Yelp — startups needing capital"
-    source_type = "scrape"
+# ---- 63. Foursquare New Businesses ----
+class FoursquareNewBusinesses(Collector):
+    name = "foursquare_new"
+    description = "Recently opened businesses via Foursquare — startups needing capital"
+    source_type = "api"
     schedule = "weekly"
+    requires_key = "FOURSQUARE_API_KEY"
     tier = "B"
     default_strength = 20.0
 
     def collect(self, **kwargs) -> list[Signal]:
+        key = os.getenv("FOURSQUARE_API_KEY", "").strip()
+        if not key:
+            return []
         signals = []
         location = kwargs.get("location", "Minneapolis, MN")
-        resp = self._scrape_get(f"https://www.yelp.com/search?find_desc=new+business&find_loc={quote_plus(location)}&attrs=BusinessOpenedRecently")
+        resp = self._get(
+            "https://api.foursquare.com/v3/places/search",
+            params={"near": location, "sort": "DISTANCE", "limit": 20},
+            headers={"Authorization": key, "Accept": "application/json"},
+        )
         if not resp:
             return signals
-        names = re.findall(r'"name"\s*:\s*"([^"]{3,60})"', resp.text)
-        for n in set(list(names)[:10]):
+        for place in (resp.json().get("results") or []):
+            name = place.get("name", "")
+            if not name:
+                continue
+            addr_parts = place.get("location") or {}
+            addr = ", ".join(filter(None, [addr_parts.get("address"), addr_parts.get("locality")]))
             signals.append(Signal(
-                business_name=n.strip(), location=location,
-                signal_type="new_business_opened", strength=self.default_strength,
+                business_name=name,
+                location=addr or location,
+                signal_type="new_business_opened",
+                strength=self.default_strength,
                 source=self.name,
+                raw_data={"fsq_id": place.get("fsq_id", "")},
             ))
-        _log(self.name, f"found {len(signals)} new business signals")
+        _log(self.name, f"found {len(signals)} Foursquare new business signals")
         return signals
 
 
@@ -1676,7 +1704,7 @@ ALL_COLLECTORS: list[type[Collector]] = [
 
     # Tier B — Moderate
     GooglePlacesChanges,       # 6
-    YelpActivity,              # 7
+    FoursquareActivity,        # 7 (replaces Yelp)
     MNSosNewBusinesses,        # 8
     WISosBusinesses,           # 10
     IASosBusinesses,           # 11
@@ -1733,7 +1761,7 @@ ALL_COLLECTORS: list[type[Collector]] = [
     SBADisasterLoans,          # 60
     FacebookMarketplace,       # 61
     ThumbTackPros,             # 62
-    YelpNewBusinesses,         # 63
+    FoursquareNewBusinesses,   # 63 (replaces Yelp new businesses)
     FoodDeliveryGrowth,        # 64
     MNDEEDJobVacancies,        # 65
     CommercialTruckSales,      # 66

@@ -391,13 +391,14 @@ async function runQualify(){
 async function pageLenders(){
   try {
     const d = await API.get('/api/lenders');
-    document.getElementById('lenders-list').innerHTML = `<table><thead><tr><th>Lender</th><th>Grades</th><th>Min Rev</th><th>Commission</th><th>Speed</th><th>Approval rate</th></tr></thead><tbody>`+
+    document.getElementById('lenders-list').innerHTML = `<table><thead><tr><th>Type</th><th>Lender</th><th>Grades</th><th>Min Rev</th><th>Commission</th><th>Speed</th><th>Approval rate</th></tr></thead><tbody>`+
       d.lenders.map(L=>`<tr>
+        <td>${L.product_type==='sba'?`<span class="pill green">SBA ${(L.sba_program||'').toUpperCase()}</span>`:`<span class="pill cyan">${(L.product_type||'mca').toUpperCase()}</span>`}</td>
         <td><strong>${esc(L.name)}</strong><br><span style="font-size:11px;color:var(--faint)">${esc(L.notes||'')}</span></td>
         <td>${L.paper_grades.map(g=>`<span class="pill grade-${g.toUpperCase()}">${g.toUpperCase()}</span>`).join(' ')}</td>
         <td>${money(L.min_revenue)}/mo</td>
         <td><span class="pill amber">${L.commission_pct}%</span></td>
-        <td>${L.funds_same_day?'<span class="pill green">same-day</span>':'—'}</td>
+        <td>${L.funds_same_day?'<span class="pill green">same-day</span>':`${L.typical_close_days||3}d`}</td>
         <td>${L.submissions?Math.round(L.approval_rate*100)+'%':'<span style="color:var(--faint)">no data</span>'}</td>
       </tr>`).join('')+`</tbody></table>`;
   } catch(e){ toast(e.message); }
@@ -456,10 +457,11 @@ async function runAnalyzer(){
     if(q.qualified){
       html += `<div style="font-size:24px;font-weight:800;margin:10px 0">Grade <span class="pill grade-${q.paper_grade}" style="font-size:20px;padding:3px 12px">${q.paper_grade}</span> · Score ${q.qual_score}</div>`;
       html += q.reasons.map(x=>`<div style="color:var(--green);font-size:13px">✓ ${esc(x)}</div>`).join('');
+      if(r.sba_advisory){html += `<div style="margin:12px 0;padding:12px 14px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.25);border-radius:10px;font-size:13px;color:var(--green)"><strong>💡 SBA eligible</strong> — ${esc(r.sba_advisory)}</div>`;}
       if(r.lender_matches){
         html += `<h3 style="margin-top:16px">Matched lenders</h3>`;
-        html += r.lender_matches.map(m=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
-          <span><strong>${esc(m.lender_name)}</strong> · ${m.commission_pct}%</span>
+        html += r.lender_matches.map(m=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:8px">
+          <span><strong>${esc(m.lender_name)}</strong>${m.is_sba?' <span class="pill green" style="font-size:10px">SBA</span>':''} · ${m.commission_pct}%${m.typical_close_days>7?' · '+m.typical_close_days+'d':''}</span>
           <span style="color:var(--amber)">${money(m.estimated_commission)}</span></div>`).join('');
       }
     } else {

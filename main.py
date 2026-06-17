@@ -174,6 +174,8 @@ class Lender(Base):
 
     id = Column(String, primary_key=True, default=_uid)
     name = Column(String, default="")
+    product_type = Column(String, default="mca")       # mca | sba | term | loc | equipment | rbf
+    sba_program = Column(String, default="")           # 7a | 504 | microloan | "" (non-SBA)
     paper_grades = Column(String, default="A,B")      # which grades they fund
     min_revenue = Column(Float, default=0.0)           # monthly
     min_tib_months = Column(Integer, default=6)
@@ -182,8 +184,9 @@ class Lender(Base):
     min_amount = Column(Float, default=5000.0)
     industries = Column(Text, default="")              # comma-sep; empty = all
     excluded_industries = Column(Text, default="")
-    commission_pct = Column(Float, default=8.0)        # your points
+    commission_pct = Column(Float, default=8.0)        # your points / referral %
     funds_same_day = Column(Boolean, default=False)
+    typical_close_days = Column(Integer, default=3)    # how long to fund
     notes = Column(Text, default="")
     active = Column(Boolean, default=True)
 
@@ -202,11 +205,14 @@ class Lender(Base):
     def to_dict(self) -> dict:
         return {
             "id": self.id, "name": self.name,
+            "product_type": self.product_type or "mca",
+            "sba_program": self.sba_program or "",
             "paper_grades": self._csv(self.paper_grades),
             "min_revenue": self.min_revenue, "min_tib_months": self.min_tib_months,
             "min_credit": self.min_credit, "max_amount": self.max_amount, "min_amount": self.min_amount,
             "industries": self._csv(self.industries), "excluded_industries": self._csv(self.excluded_industries),
             "commission_pct": self.commission_pct, "funds_same_day": self.funds_same_day,
+            "typical_close_days": self.typical_close_days or 3,
             "notes": self.notes, "active": self.active,
             "submissions": self.submissions, "approvals": self.approvals, "fundings": self.fundings,
             "approval_rate": self.approval_rate(), "total_commission": self.total_commission,
@@ -325,24 +331,64 @@ def get_db():
 # Seed default lender panel (your starter ISO relationships)
 # ---------------------------------------------------------------------------
 DEFAULT_LENDERS = [
-    {"name": "Credibly", "paper_grades": "A,B,C", "min_revenue": 15000, "min_tib_months": 6,
-     "min_credit": 500, "max_amount": 400000, "commission_pct": 8, "funds_same_day": True,
-     "notes": "Broad coverage, 4-hour approvals, both white-label and referral tracks."},
-    {"name": "Fora Financial", "paper_grades": "A,B", "min_revenue": 20000, "min_tib_months": 6,
-     "min_credit": 570, "max_amount": 1500000, "commission_pct": 10, "funds_same_day": False,
-     "notes": "No personal guarantee, pays renewals for lifetime of client."},
-    {"name": "Rapid Finance", "paper_grades": "A,B,C", "min_revenue": 15000, "min_tib_months": 12,
-     "min_credit": 550, "max_amount": 500000, "commission_pct": 9, "funds_same_day": False,
-     "notes": "$2B+ funded, factor 1.15-1.50, also SBA/term/bridge."},
-    {"name": "Greenbox Capital", "paper_grades": "B,C,D", "min_revenue": 10000, "min_tib_months": 5,
-     "min_credit": 500, "max_amount": 250000, "commission_pct": 15, "funds_same_day": True,
+    # ── MCA / Alternative lenders (fast, higher commission) ─────────────── #
+    {"name": "Credibly", "product_type": "mca", "paper_grades": "A,B,C",
+     "min_revenue": 15000, "min_tib_months": 6, "min_credit": 500,
+     "max_amount": 400000, "commission_pct": 8, "funds_same_day": True,
+     "typical_close_days": 1,
+     "notes": "Broad coverage, 4-hour approvals. Both white-label and referral tracks."},
+    {"name": "Fora Financial", "product_type": "mca", "paper_grades": "A,B",
+     "min_revenue": 20000, "min_tib_months": 6, "min_credit": 570,
+     "max_amount": 1500000, "commission_pct": 10, "funds_same_day": False,
+     "typical_close_days": 2,
+     "notes": "No personal guarantee. Pays renewals for lifetime of client."},
+    {"name": "Rapid Finance", "product_type": "mca", "paper_grades": "A,B,C",
+     "min_revenue": 15000, "min_tib_months": 12, "min_credit": 550,
+     "max_amount": 500000, "commission_pct": 9, "funds_same_day": False,
+     "typical_close_days": 2,
+     "notes": "$2B+ funded. Factor 1.15-1.50. Also does SBA/term/bridge."},
+    {"name": "Greenbox Capital", "product_type": "mca", "paper_grades": "B,C,D",
+     "min_revenue": 10000, "min_tib_months": 5, "min_credit": 500,
+     "max_amount": 250000, "commission_pct": 15, "funds_same_day": True,
+     "typical_close_days": 1,
      "notes": "Highest commissions (up to 19%). Zero-tolerance for double-funding."},
-    {"name": "OnDeck", "paper_grades": "A", "min_revenue": 8333, "min_tib_months": 12,
-     "min_credit": 600, "max_amount": 250000, "commission_pct": 4, "funds_same_day": True,
+    {"name": "OnDeck", "product_type": "term", "paper_grades": "A",
+     "min_revenue": 8333, "min_tib_months": 12, "min_credit": 600,
+     "max_amount": 250000, "commission_pct": 4, "funds_same_day": True,
+     "typical_close_days": 1,
      "notes": "A-paper term loans + LOC. Lower commission, stronger borrowers."},
-    {"name": "Forward Financing", "paper_grades": "B,C", "min_revenue": 10000, "min_tib_months": 6,
-     "min_credit": 500, "max_amount": 300000, "commission_pct": 12, "funds_same_day": True,
-     "notes": "Solid B-paper funder, fast."},
+    {"name": "Forward Financing", "product_type": "mca", "paper_grades": "B,C",
+     "min_revenue": 10000, "min_tib_months": 6, "min_credit": 500,
+     "max_amount": 300000, "commission_pct": 12, "funds_same_day": True,
+     "typical_close_days": 1,
+     "notes": "Solid B-paper funder, fast approvals."},
+
+    # ── SBA lenders (slower, lower commission, but MUCH better for merchant) #
+    {"name": "Huntington Bank (SBA)", "product_type": "sba", "sba_program": "7a",
+     "paper_grades": "A", "min_revenue": 20000, "min_tib_months": 24,
+     "min_credit": 650, "max_amount": 5000000, "min_amount": 50000,
+     "commission_pct": 1, "funds_same_day": False, "typical_close_days": 45,
+     "notes": "Top SBA 7(a) lender nationally. 1% referral fee. Takes 30-60 days. Best for A-paper merchants with 2+ years TIB who can wait."},
+    {"name": "Live Oak Bank (SBA)", "product_type": "sba", "sba_program": "7a",
+     "paper_grades": "A", "min_revenue": 15000, "min_tib_months": 24,
+     "min_credit": 650, "max_amount": 5000000, "min_amount": 25000,
+     "commission_pct": 1.5, "funds_same_day": False, "typical_close_days": 45,
+     "notes": "Industry-specialist SBA lender. Strong in veterinary, dental, fitness. 1-2% referral."},
+    {"name": "Newtek Bank (SBA)", "product_type": "sba", "sba_program": "7a",
+     "paper_grades": "A,B", "min_revenue": 12500, "min_tib_months": 24,
+     "min_credit": 620, "max_amount": 5000000, "min_amount": 25000,
+     "commission_pct": 1, "funds_same_day": False, "typical_close_days": 40,
+     "notes": "Online SBA lender, slightly more flexible than traditional banks. Takes broker referrals."},
+    {"name": "Midwest Bank Holdings (SBA)", "product_type": "sba", "sba_program": "7a",
+     "paper_grades": "A", "min_revenue": 15000, "min_tib_months": 24,
+     "min_credit": 650, "max_amount": 2000000, "min_amount": 50000,
+     "commission_pct": 1, "funds_same_day": False, "typical_close_days": 50,
+     "notes": "MN-based SBA lender. Good for local relationships. Preferred for MN merchants."},
+    {"name": "SBA Microloan (via MN CDFIs)", "product_type": "sba", "sba_program": "microloan",
+     "paper_grades": "B,C", "min_revenue": 5000, "min_tib_months": 6,
+     "min_credit": 575, "max_amount": 50000, "min_amount": 5000,
+     "commission_pct": 0, "funds_same_day": False, "typical_close_days": 30,
+     "notes": "SBA Microloan via MN CDFIs (Accion, Metropolitan Consortium). No broker fee but right for small/early merchants who can't get MCA. Referral builds goodwill."},
 ]
 
 
@@ -506,15 +552,28 @@ def qualify(d: QualifyInput, db: Session = Depends(get_db)):
 
     # Estimate amount range and lender matches if qualified
     if result["qualified"]:
-        # Typical: advance ~ 1x monthly revenue (range 0.5x-1.5x)
         est_low = round(d.monthly_revenue * 0.5, -3)
         est_high = round(d.monthly_revenue * 1.25, -3)
         result["estimated_amount"] = {"low": est_low, "high": est_high}
         result["estimated_factor"] = {"A": "1.15-1.25", "B": "1.25-1.40", "C": "1.35-1.49", "D": "1.40-1.49"}.get(result["paper_grade"], "1.25-1.40")
 
-        # Match lenders
+        # SBA eligibility advisory — the ethical layer
+        cf = _credit_floor(d.credit_range)
+        sba_eligible = (
+            d.time_in_business_months >= 24 and cf >= 650 and
+            d.monthly_revenue >= 15000 and d.existing_positions == 0 and
+            d.timeline not in ("ASAP", "1-2 weeks")
+        )
+        result["sba_eligible"] = sba_eligible
+        result["sba_advisory"] = (
+            "This merchant likely qualifies for an SBA loan (~6-10% effective rate vs 40-80% MCA). "
+            "If they can wait 30-60 days, present SBA as the primary option — it's significantly "
+            "cheaper for them. Your referral fee is 1-2% but you build a much stronger relationship."
+        ) if sba_eligible else None
+
+        # Match lenders — MCA first, SBA appended if eligible
         matches = match_lenders(d, result["paper_grade"], db)
-        result["lender_matches"] = matches[:3]
+        result["lender_matches"] = matches[:6]
     return result
 
 
@@ -532,57 +591,72 @@ def match_lenders(d: QualifyInput, paper_grade: str, db: Session) -> list[dict]:
         score = 0.0
         reasons = []
         grades = L._csv(L.paper_grades)
+        is_sba = (L.product_type or "mca") == "sba"
 
-        # Paper grade fit (0-25) — must be able to fund this grade
-        if paper_grade.lower() in [g.lower() for g in grades] or paper_grade == "DECLINE":
-            score += 25
-        else:
-            continue  # lender can't fund this paper grade — skip
+        # SBA-specific gate: merchant must be able to wait
+        if is_sba:
+            if d.timeline in ("ASAP", "1-2 weeks"):
+                continue  # SBA takes 30-60 days — don't show if they need cash fast
+            if d.time_in_business_months < 24:
+                continue  # SBA wants 2+ years in almost all cases
+            if cf < 620:
+                continue  # SBA credit floor
 
-        # Industry fit (0-20)
+        # Paper grade fit — must be able to fund this grade
+        if paper_grade.lower() not in [g.lower() for g in grades]:
+            if paper_grade != "DECLINE":
+                continue
+
+        # Industry fit
         inds = L._csv(L.industries)
         excl = L._csv(L.excluded_industries)
         if industry and industry in excl:
-            continue  # excluded
+            continue
         if not inds or (industry and industry in inds):
             score += 20
             if inds:
                 reasons.append("Industry match")
         else:
-            score += 10  # neutral
+            score += 10
 
-        # Revenue fit (0-15)
+        # Revenue fit
         if d.monthly_revenue >= L.min_revenue:
             score += 15
         else:
-            continue  # doesn't meet minimum
+            continue
 
-        # TIB fit (0-10)
+        # TIB fit
         if d.time_in_business_months >= L.min_tib_months:
             score += 10
         else:
             continue
 
-        # Credit fit (0-10)
+        # Credit fit
         if cf >= L.min_credit:
             score += 10
-            reasons.append("Credit qualifies")
+            if cf >= (L.min_credit + 100):
+                reasons.append("Strong credit for this lender")
 
-        # Amount fit (0-10)
+        # Amount fit
         amt = d.amount_requested or d.monthly_revenue
         if L.min_amount <= amt <= L.max_amount:
             score += 10
         elif amt > L.max_amount:
             score += 3
-            reasons.append("Amount near lender max")
 
-        # Speed fit (0-5)
+        # Speed fit
         if d.timeline == "ASAP" and L.funds_same_day:
-            score += 5; reasons.append("Same-day funding")
+            score += 8; reasons.append("Same-day funding")
         elif L.funds_same_day:
-            score += 3
+            score += 4
 
-        # Learned relationship bonus (0-5)
+        # SBA bonus: if merchant qualifies, surface SBA as the ethical "better deal" option
+        if is_sba:
+            score += 15
+            reasons.append(f"SBA {L.sba_program.upper()} — much lower cost for merchant (~6-10% vs MCA)")
+            reasons.append(f"Typical close: {L.typical_close_days} days")
+
+        # Learned relationship bonus
         ar = L.approval_rate()
         score += ar * 5
 
@@ -591,17 +665,23 @@ def match_lenders(d: QualifyInput, paper_grade: str, db: Session) -> list[dict]:
         results.append({
             "lender_id": L.id,
             "lender_name": L.name,
+            "product_type": L.product_type or "mca",
+            "sba_program": L.sba_program or "",
             "match_score": round(min(score, 100), 1),
             "commission_pct": L.commission_pct,
             "estimated_commission": est_commission,
             "funds_same_day": L.funds_same_day,
+            "typical_close_days": L.typical_close_days or 3,
             "approval_rate": ar,
             "reasons": reasons,
             "notes": L.notes,
+            "is_sba": is_sba,
         })
 
-    results.sort(key=lambda x: x["match_score"], reverse=True)
-    return results
+    # Sort: MCA first (urgent), SBA second (better deal when applicable)
+    mca = sorted([x for x in results if not x["is_sba"]], key=lambda x: x["match_score"], reverse=True)
+    sba = sorted([x for x in results if x["is_sba"]], key=lambda x: x["match_score"], reverse=True)
+    return mca + sba
 
 
 # ===========================================================================
