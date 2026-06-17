@@ -1564,6 +1564,45 @@ def draft_outreach(d: OutreachInput, db: Session = Depends(get_db)):
 
 
 # ===========================================================================
+# DATABASE RESET (guarded)
+# ===========================================================================
+
+class ResetInput(BaseModel):
+    confirm: str = ""
+    keep_lenders: bool = True
+
+
+@app.post("/api/admin/reset")
+def reset_database(payload: ResetInput, db: Session = Depends(get_db)):
+    """
+    Wipe deals, signals, partners. Keeps your lender panel by default.
+    Requires confirm == "DELETE EVERYTHING" to prevent accidents.
+    """
+    if payload.confirm != "DELETE EVERYTHING":
+        raise HTTPException(400, 'Send {"confirm": "DELETE EVERYTHING"} to reset.')
+
+    deleted = {}
+    for model, name in [(Deal, "deals"), (SignalRecord, "signals"), (ReferralPartner, "partners")]:
+        rows = db.execute(select(model)).scalars().all()
+        deleted[name] = len(rows)
+        for r in rows:
+            db.delete(r)
+
+    if not payload.keep_lenders:
+        lenders = db.execute(select(Lender)).scalars().all()
+        deleted["lenders"] = len(lenders)
+        for L in lenders:
+            db.delete(L)
+        db.commit()
+        seed_lenders(db)  # re-seed defaults
+    else:
+        db.commit()
+
+    return {"status": "reset complete", "deleted": deleted,
+            "lenders_kept": payload.keep_lenders}
+
+
+# ===========================================================================
 # DASHBOARD STATS
 # ===========================================================================
 
