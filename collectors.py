@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
@@ -23,6 +24,20 @@ from typing import Any
 from urllib.parse import quote_plus, urlencode
 
 import httpx
+
+# Make config.py importable regardless of working directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from config import TARGET_STATES, TARGET_CITIES, TARGET_INDUSTRIES, cities_as_list
+    # Limit render-heavy scrapers to the top 2 states to conserve Firecrawl credits
+    RENDER_STATES = TARGET_STATES[:2]
+except Exception:
+    TARGET_STATES = ["MN", "WI", "IA", "SD", "ND"]
+    TARGET_CITIES = ["Minneapolis,MN", "St Paul,MN", "Milwaukee,WI"]
+    TARGET_INDUSTRIES = []
+    RENDER_STATES = ["MN", "WI"]
+    def cities_as_list():
+        return ["Minneapolis, MN", "St Paul, MN", "Milwaukee, WI"]
 
 # ---------------------------------------------------------------------------
 # Config
@@ -38,6 +53,31 @@ def _now() -> datetime:
 
 def _log(src: str, msg: str):
     print(f"[{_now().isoformat()[:19]}] [{src}] {msg}")
+
+
+def _extract_contact_hints(text: str, url: str = "") -> dict:
+    """Pull phone, email, website from page text/markdown."""
+    hints = {}
+    if not text:
+        return hints
+    phones = re.findall(r'\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}', text)
+    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+    websites = re.findall(r'https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s"\'<>\)]*)?', text)
+    # Filter out common junk domains
+    junk = ("indeed.com", "craigslist.org", "bizbuysell.com", "google.com", "facebook.com",
+            "twitter.com", "linkedin.com", "schema.org", "w3.org", "gstatic.com",
+            "googleapis.com", "cloudflare", "firecrawl")
+    if phones:
+        hints["phone"] = phones[0]
+    if emails:
+        clean = [e for e in emails if not any(j in e.lower() for j in junk)]
+        if clean:
+            hints["email"] = clean[0]
+    if websites:
+        clean = [w for w in websites if not any(j in w.lower() for j in junk)]
+        if clean:
+            hints["website"] = clean[0]
+    return hints
 
 
 class _ScrapeResult:
@@ -345,28 +385,31 @@ class IndeedJobs(Collector):
 
     def collect(self, **kwargs) -> list[Signal]:
         signals = []
-        cities = kwargs.get("cities", ["Minneapolis, MN", "St Paul, MN"])
+        cities = cities_as_list()[:2]  # conserve credits
         for city in cities:
-            # Indeed's public search (no API needed)
             q = quote_plus("hiring multiple positions")
             loc = quote_plus(city)
-            resp = self._scrape_get(f"https://www.indeed.com/jobs?q={q}&l={loc}&sort=date&limit=25")
+            resp = self._scrape_get(f"https://www.indeed.com/jobs?q={q}&l={loc}&sort=date&limit=25", render=True)
             if not resp:
+                _log(self.name, "Indeed blocked — requires Indeed Publisher API or headless browser")
                 continue
-            # Extract company names from job cards (basic pattern matching)
-            text = resp.text
-            # Indeed uses data-company-name or companyName in their HTML
+            text = getattr(resp, "text", "") or ""
+            # Primary: data-testid company name
             companies = re.findall(r'data-testid="company-name"[^>]*>([^<]+)<', text)
+            # Fallback 1: companyName JSON field
             if not companies:
                 companies = re.findall(r'"companyName"\s*:\s*"([^"]+)"', text)
-            # Count postings per company
+            # Fallback 2: JSON-LD JobPosting hiringOrganization
+            if not companies:
+                companies = re.findall(r'"hiringOrganization"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', text)
             counts: dict[str, int] = {}
             for co in companies:
                 co = co.strip()
                 if co:
                     counts[co] = counts.get(co, 0) + 1
             for co, cnt in counts.items():
-                if cnt >= 2:  # 2+ postings on one page = hiring surge
+                if cnt >= 2:
+                    hints = _extract_contact_hints(text)
                     signals.append(Signal(
                         business_name=co,
                         location=city,
@@ -374,9 +417,12 @@ class IndeedJobs(Collector):
                         strength=self.default_strength + min(cnt * 2, 10),
                         source=self.name,
                         source_url=f"https://www.indeed.com/cmp/{quote_plus(co)}/jobs",
+                        urgency="growth",
+                        data_source_quality="scraped",
+                        contact_hints=hints,
                         raw_data={"job_count": cnt, "city": city},
                     ))
-        _log(self.name, f"found {len(signals)} hiring signals")
+        _log(self.name, f"found {len(signals)} Indeed hiring signals")
         return signals
 
 
@@ -444,100 +490,6 @@ class SECEdgarFilings(Collector):
 # TIER B — Moderate intent signals
 # ===========================================================================
 
-# ---- 6. Google Places — New/Changed Businesses ----
-class GooglePlacesChanges(Collector):
-    name = "google_places_changes"
-    description = "Google Business Profile changes — reduced hours, new locations, name changes"
-    source_type = "api"
-    schedule = "daily"
-    requires_key = "GOOGLE_MAPS_API_KEY"
-    tier = "B"
-    default_strength = 20.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
-        if not key:
-            return []
-        signals = []
-        # Search for recently opened businesses in target area
-        queries = kwargs.get("queries", ["new business Minneapolis", "now open Minneapolis"])
-        for q in queries[:3]:
-            resp = self._get("https://maps.googleapis.com/maps/api/place/textsearch/json", params={
-                "query": q, "key": key,
-            })
-            if not resp:
-                continue
-            for place in (resp.json().get("results") or [])[:10]:
-                if place.get("business_status") == "OPERATIONAL":
-                    signals.append(Signal(
-                        business_name=place.get("name", ""),
-                        location=place.get("formatted_address", ""),
-                        signal_type="new_or_changed_business",
-                        strength=self.default_strength,
-                        source=self.name,
-                        raw_data={"rating": place.get("rating"), "types": place.get("types", [])[:5]},
-                        contact_hints={"address": place.get("formatted_address", "")},
-                    ))
-        _log(self.name, f"found {len(signals)} places signals")
-        return signals
-
-
-# ---- 7. Foursquare Places — New / Active Businesses ----
-class FoursquareActivity(Collector):
-    name = "foursquare_places"
-    description = "Foursquare Places API — active local businesses, new openings, review velocity"
-    source_type = "api"
-    schedule = "weekly"
-    requires_key = "FOURSQUARE_API_KEY"
-    tier = "B"
-    default_strength = 20.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        key = os.getenv("FOURSQUARE_API_KEY", "").strip().strip('"').strip("'")
-        if key.lower().startswith("bearer "):
-            key = key[7:].strip()
-        if not key:
-            return []
-        _log(self.name, f"key len={len(key)} prefix={key[:6]}...")
-        signals = []
-        location = kwargs.get("location", "Minneapolis, MN")
-        # Foursquare Places API v3 — free 1,000 req/hour
-        categories = [
-            ("17000", "food"),           # Food & Dining
-            ("11000", "professional"),   # Professional Services
-            ("12000", "retail"),         # Retail
-            ("15000", "travel"),         # Travel & Transport
-        ]
-        for cat_id, cat_name in categories[:3]:
-            resp = self._get(
-                "https://api.foursquare.com/v3/places/search",
-                params={"near": location, "categories": cat_id, "limit": 15, "sort": "RATING"},
-                headers={"Authorization": key, "Accept": "application/json"},
-            )
-            if not resp:
-                continue
-            for place in (resp.json().get("results") or []):
-                name = place.get("name", "")
-                geocode = (place.get("geocodes") or {}).get("main") or {}
-                addr_parts = place.get("location") or {}
-                addr = ", ".join(filter(None, [addr_parts.get("address"), addr_parts.get("locality"), addr_parts.get("region")]))
-                stats = place.get("stats") or {}
-                if not name:
-                    continue
-                signals.append(Signal(
-                    business_name=name,
-                    location=addr or location,
-                    signal_type="active_local_business",
-                    strength=self.default_strength,
-                    source=self.name,
-                    raw_data={"category": cat_name, "total_photos": stats.get("total_photos", 0),
-                              "total_ratings": stats.get("total_ratings", 0)},
-                    contact_hints={"address": addr},
-                ))
-        _log(self.name, f"found {len(signals)} Foursquare signals")
-        return signals
-
-
 # ---- 8. Minnesota Secretary of State — New Business Filings ----
 class MNSosNewBusinesses(Collector):
     name = "mn_sos_new_businesses"
@@ -561,19 +513,71 @@ class MNSosNewBusinesses(Collector):
         return signals
 
 
-# ---- 9. Minnesota SOS — UCC Filings ----
+# ---- 9. UCC Filings — existing MCA positions / renewal windows ----
 class MNSosUCCFilings(Collector):
-    name = "mn_sos_ucc"
-    description = "UCC filings approaching payoff — existing MCA about to be paid off = renewal window"
+    name = "ucc_filings"
+    description = "UCC-1/UCC-3 filings — businesses with existing MCA positions (renewal/refi window)"
     source_type = "scrape"
     schedule = "weekly"
     tier = "A"
-    default_strength = 32.0
+    default_strength = 38.0
+
+    UCC_PORTALS = {
+        "MN": "https://mblsportal.sos.state.mn.us/UCC/Search",
+        "WI": "https://www.wdfi.org/apps/ucc/",
+    }
 
     def collect(self, **kwargs) -> list[Signal]:
-        # MN UCC search: https://mblsportal.sos.state.mn.us/UCC/Search
-        _log(self.name, "MN SOS UCC search requires headless browser — planned for v0.2")
-        return []
+        signals = []
+        for st in RENDER_STATES:
+            url = self.UCC_PORTALS.get(st)
+            if not url:
+                continue
+            resp = self._scrape_get(url, render=True)
+            if not resp:
+                _log(self.name, f"UCC data available at {url} — automation blocked, search manually")
+                continue
+            text = getattr(resp, "text", "") or ""
+            # Look for debtor/secured-party pairs in the rendered content
+            # Filings list a debtor (the business) and secured party (the lender they owe)
+            debtors = re.findall(r'(?:Debtor|Borrower)[:\s]+([A-Z][A-Za-z0-9&.,\' ]{3,50})', text)
+            secured = re.findall(r'(?:Secured Party|Lender)[:\s]+([A-Z][A-Za-z0-9&.,\' ]{3,50})', text)
+            dates = re.findall(r'\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b', text)
+            if not debtors:
+                _log(self.name, f"{st}: UCC portal reachable but no parseable filings — search {url}")
+                continue
+            for i, deb in enumerate(debtors[:15]):
+                deb = deb.strip()
+                sp = secured[i].strip() if i < len(secured) else ""
+                fdate = dates[i] if i < len(dates) else ""
+                # Recency → new vs existing
+                is_new = True
+                try:
+                    for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
+                        try:
+                            d = datetime.strptime(fdate, fmt)
+                            is_new = (datetime.now() - d).days < 90
+                            break
+                        except ValueError:
+                            continue
+                except Exception:
+                    pass
+                hints = _extract_contact_hints(text)
+                signals.append(Signal(
+                    business_name=deb,
+                    location=st,
+                    signal_type="ucc_filing_new" if is_new else "ucc_filing_existing",
+                    strength=self.default_strength,
+                    source=self.name,
+                    source_url=url,
+                    urgency="debt_refi",
+                    data_source_quality="scraped",
+                    contact_hints=hints,
+                    contact_availability="research_required" if not hints else "",
+                    raw_data={"secured_party": sp, "filing_date": fdate, "state": st},
+                ))
+        _log(self.name, f"found {len(signals)} UCC signals")
+        return signals
 
 
 # ---- 10. Wisconsin SOS — Business Filings ----
@@ -672,33 +676,79 @@ class OpenCorporatesSearch(Collector):
 # ---- 15. BizBuySell Listings ----
 class BizBuySellListings(Collector):
     name = "bizbuysell"
-    description = "Businesses for sale — owners ready to exit, may need bridge capital or buyer matching"
+    description = "Businesses for sale — owners ready to exit, may need bridge capital to close"
     source_type = "scrape"
     schedule = "weekly"
     market = "micro_acq"
     tier = "B"
-    default_strength = 22.0
+    default_strength = 32.0
+
+    STATE_URLS = {
+        "MN": "https://www.bizbuysell.com/minnesota-businesses-for-sale/",
+        "WI": "https://www.bizbuysell.com/wisconsin-businesses-for-sale/",
+        "IA": "https://www.bizbuysell.com/iowa-businesses-for-sale/",
+    }
 
     def collect(self, **kwargs) -> list[Signal]:
         signals = []
-        state = kwargs.get("state", "minnesota")
-        resp = self._scrape_get(f"https://www.bizbuysell.com/minnesota-businesses-for-sale/")
-        if not resp:
-            return signals
-        # Extract listing titles and asking prices
-        titles = re.findall(r'class="listing-title[^"]*"[^>]*>([^<]+)<', resp.text)
-        prices = re.findall(r'Asking Price:\s*\$([0-9,]+)', resp.text)
-        for i, title in enumerate(titles[:20]):
-            price = prices[i] if i < len(prices) else ""
-            signals.append(Signal(
-                business_name=title.strip(),
-                location=state.title(),
-                signal_type="business_for_sale",
-                strength=self.default_strength,
-                source=self.name,
-                source_url=f"https://www.bizbuysell.com/minnesota-businesses-for-sale/",
-                raw_data={"asking_price": price, "title": title.strip()},
-            ))
+        for st in RENDER_STATES:
+            url = self.STATE_URLS.get(st)
+            if not url:
+                continue
+            resp = None
+            for attempt in range(2):
+                resp = self._scrape_get(url, render=True)
+                if resp:
+                    break
+            if not resp:
+                _log(self.name, f"{st}: blocked after retries — browse manually at {url}")
+                continue
+            text = getattr(resp, "text", "") or ""
+            md = getattr(resp, "markdown", "") or text
+
+            # In markdown, listings often appear as headers/links with prices nearby
+            titles = re.findall(r'(?:^|\n)#{1,4}\s*([A-Z][^\n#]{8,70})', md)
+            if not titles:
+                titles = re.findall(r'\[([A-Z][^\]]{8,70})\]\(', md)  # markdown links
+            if not titles:
+                titles = re.findall(r'class="listing-title[^"]*"[^>]*>([^<]+)<', text)
+
+            prices = re.findall(r'(?:Asking Price|Price)[:\s]*\$([0-9,]+)', text)
+            revenues = re.findall(r'(?:Revenue|Gross Revenue)[:\s]*\$([0-9,]+)', text)
+            cashflows = re.findall(r'(?:Cash Flow|Cash flow)[:\s]*\$([0-9,]+)', text)
+
+            count = 0
+            seen = set()
+            for i, title in enumerate(titles[:25]):
+                t = title.strip()
+                tl = t.lower()
+                if not t or t in seen:
+                    continue
+                if any(skip in tl for skip in ["businesses for sale", "search", "filter", "sign in",
+                                                "create account", "saved", "franchise opportunit"]):
+                    continue
+                seen.add(t)
+                price = prices[i] if i < len(prices) else ""
+                rev = revenues[i] if i < len(revenues) else ""
+                cf = cashflows[i] if i < len(cashflows) else ""
+                hints = _extract_contact_hints(text)
+                rev_est = f"${rev}/yr" if rev else ""
+                signals.append(Signal(
+                    business_name=t,
+                    location=st,
+                    signal_type="business_for_sale",
+                    strength=self.default_strength,
+                    source=self.name,
+                    source_url=url,
+                    urgency="expansion",
+                    revenue_estimate=rev_est,
+                    data_source_quality="scraped" if (price or rev) else "partial",
+                    contact_hints=hints,
+                    raw_data={"asking_price": price, "revenue": rev, "cash_flow": cf, "state": st},
+                ))
+                count += 1
+            if count < 3:
+                _log(self.name, f"{st}: only {count} parsed — listings page may need selector update ({url})")
         _log(self.name, f"found {len(signals)} BizBuySell signals")
         return signals
 
@@ -706,31 +756,106 @@ class BizBuySellListings(Collector):
 # ---- 16. Craigslist Business-for-Sale ----
 class CraigslistBFS(Collector):
     name = "craigslist_bfs"
-    description = "Craigslist business-for-sale — informal sellers, often motivated"
+    description = "Craigslist business-for-sale — informal sellers, often motivated, contact in body"
     source_type = "scrape"
     schedule = "daily"
     market = "micro_acq"
     tier = "B"
-    default_strength = 20.0
+    default_strength = 24.0
+
+    CITIES = {"MN": "minneapolis", "WI": "milwaukee"}
 
     def collect(self, **kwargs) -> list[Signal]:
         signals = []
-        city = kwargs.get("cl_city", "minneapolis")
-        resp = self._scrape_get(f"https://{city}.craigslist.org/search/bfs")
-        if not resp:
-            return signals
-        titles = re.findall(r'class="posting-title"[^>]*>\s*<span[^>]*>([^<]+)<', resp.text)
-        if not titles:
-            titles = re.findall(r'<a[^>]*class="titlestring"[^>]*>([^<]+)<', resp.text)
-        for t in titles[:15]:
-            signals.append(Signal(
-                business_name=t.strip(),
-                location=f"{city.title()}, MN",
-                signal_type="business_for_sale_informal",
-                strength=self.default_strength,
-                source=self.name,
-            ))
-        _log(self.name, f"found {len(signals)} Craigslist signals")
+        for st in RENDER_STATES:
+            city = self.CITIES.get(st)
+            if not city:
+                continue
+            url = f"https://{city}.craigslist.org/search/bfs"
+            resp = None
+            for attempt in range(2):
+                resp = self._scrape_get(url, render=True)
+                if resp:
+                    break
+            if not resp:
+                _log(self.name, f"{city}: blocked after retry — {url}")
+                continue
+            text = getattr(resp, "text", "") or ""
+            md = getattr(resp, "markdown", "") or text
+            # Markdown listings: [Title](url) $price
+            items = re.findall(r'\[([^\]]{8,80})\]\((https?://[^\)]+)\)', md)
+            seen = set()
+            for title, link in items[:20]:
+                t = title.strip()
+                if not t or t in seen or t.lower() in ("reply", "favorite", "next", "prev"):
+                    continue
+                seen.add(t)
+                hints = _extract_contact_hints(text)
+                signals.append(Signal(
+                    business_name=t,
+                    location=f"{city.title()}, {st}",
+                    signal_type="business_for_sale_informal",
+                    strength=self.default_strength,
+                    source=self.name,
+                    source_url=link,
+                    urgency="expansion",
+                    data_source_quality="scraped",
+                    contact_hints=hints,
+                ))
+        _log(self.name, f"found {len(signals)} Craigslist BFS signals")
+        return signals
+
+
+# ---- 16b. Craigslist Jobs — hiring surge (2+ ads from same company) ----
+class CraigslistJobs(Collector):
+    name = "craigslist_jobs"
+    description = "Craigslist job postings — companies posting multiple roles = hiring surge / growth"
+    source_type = "scrape"
+    schedule = "daily"
+    tier = "B"
+    default_strength = 25.0
+
+    CITIES = {"MN": "minneapolis", "WI": "milwaukee"}
+
+    def collect(self, **kwargs) -> list[Signal]:
+        signals = []
+        for st in RENDER_STATES:
+            city = self.CITIES.get(st)
+            if not city:
+                continue
+            url = f"https://{city}.craigslist.org/search/jjj"
+            resp = self._scrape_get(url, render=True)
+            if not resp:
+                _log(self.name, f"{city} jobs: blocked — {url}")
+                continue
+            text = getattr(resp, "text", "") or ""
+            md = getattr(resp, "markdown", "") or text
+            # Count company mentions — a company with multiple ads = hiring surge
+            items = re.findall(r'\[([^\]]{8,90})\]\(', md)
+            # Try to extract company names from titles (often "Role - Company" or "Company: ...")
+            companies = {}
+            for title in items:
+                # crude: titles with a dash often have company after the dash
+                m = re.search(r'[-–]\s*([A-Z][A-Za-z0-9&.\' ]{3,40})$', title.strip())
+                if m:
+                    co = m.group(1).strip()
+                    companies[co] = companies.get(co, 0) + 1
+            for co, cnt in companies.items():
+                if cnt >= 2:
+                    hints = _extract_contact_hints(text)
+                    signals.append(Signal(
+                        business_name=co,
+                        location=f"{city.title()}, {st}",
+                        signal_type="hiring_surge",
+                        strength=self.default_strength + min(cnt * 2, 10),
+                        source=self.name,
+                        source_url=url,
+                        urgency="growth",
+                        data_source_quality="scraped",
+                        contact_hints=hints,
+                        raw_data={"posting_count": cnt},
+                    ))
+        _log(self.name, f"found {len(signals)} Craigslist jobs signals")
         return signals
 
 
@@ -746,49 +871,6 @@ class GoogleTrends(Collector):
     def collect(self, **kwargs) -> list[Signal]:
         # Google Trends doesn't have a free API; would need pytrends or scraping
         _log(self.name, "Google Trends requires pytrends library — planned for v0.2")
-        return []
-
-
-# ---- 18. BBB — Recently Accredited Businesses ----
-class BBBAccredited(Collector):
-    name = "bbb_accredited"
-    description = "BBB accredited businesses — established, credible, likely bankable"
-    source_type = "scrape"
-    schedule = "weekly"
-    tier = "C"
-    default_strength = 15.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        signals = []
-        resp = self._scrape_get("https://www.bbb.org/search?find_country=US&find_loc=Minneapolis%2C+MN&find_type=Category&page=1")
-        if not resp:
-            return signals
-        names = re.findall(r'"businessName"\s*:\s*"([^"]+)"', resp.text)
-        for name in names[:15]:
-            signals.append(Signal(
-                business_name=name.strip(),
-                location="Minneapolis, MN",
-                signal_type="bbb_accredited",
-                strength=self.default_strength,
-                source=self.name,
-            ))
-        _log(self.name, f"found {len(signals)} BBB signals")
-        return signals
-
-
-# ---- 19. WHOIS Domain Expiration ----
-class WHOISDomainExpiry(Collector):
-    name = "whois_domain_expiry"
-    description = "Business domains nearing expiration — owner losing interest, possible exit candidate"
-    source_type = "api"
-    schedule = "monthly"
-    market = "micro_acq"
-    tier = "C"
-    default_strength = 15.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        # Would check WHOIS for domains of known businesses
-        _log(self.name, "WHOIS lookup requires domain list input — enrichment collector")
         return []
 
 
@@ -827,20 +909,6 @@ class BuildingPermits(Collector):
     def collect(self, **kwargs) -> list[Signal]:
         # Minneapolis permits: https://www.minneapolismn.gov/government/programs-initiatives/development-projects/
         _log(self.name, "Building permits require city-specific scraper — planned for v0.2")
-        return []
-
-
-# ---- 22. Health Department Inspections ----
-class HealthInspections(Collector):
-    name = "health_inspections"
-    description = "Restaurant health inspections — active restaurants are fundable; new ones need capital"
-    source_type = "scrape"
-    schedule = "monthly"
-    tier = "C"
-    default_strength = 12.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        _log(self.name, "Health inspections require county-specific portal — planned for v0.2")
         return []
 
 
@@ -900,132 +968,7 @@ class LinkedInHiring(Collector):
         return signals
 
 
-# ---- 25. Hacker News — Business / Funding Discussions ----
-class HackerNewsSignals(Collector):
-    name = "hacker_news"
-    description = "Hacker News discussions about funding, revenue, hiring — founders with capital needs"
-    source_type = "api"
-    schedule = "daily"
-    tier = "B"
-    default_strength = 20.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        signals = []
-        # HN Algolia search API — completely free, no auth
-        queries = ["working capital", "revenue based financing", "small business loan",
-                   "cash flow", "hiring engineers", "growing revenue"]
-        for q in queries[:3]:
-            resp = self._get("https://hn.algolia.com/api/v1/search_by_date", params={
-                "query": q, "tags": "story", "numericFilters": "points>5",
-                "hitsPerPage": 8,
-            })
-            if not resp:
-                continue
-            try:
-                for hit in (resp.json().get("hits") or []):
-                    title = hit.get("title", "")
-                    author = hit.get("author", "")
-                    url = hit.get("url", "") or f"https://news.ycombinator.com/item?id={hit.get('objectID','')}"
-                    if not title or len(title) < 8:
-                        continue
-                    signals.append(Signal(
-                        business_name=title[:80],
-                        signal_type="founder_capital_discussion",
-                        strength=self.default_strength,
-                        source=self.name,
-                        source_url=url,
-                        raw_data={"author": author, "points": hit.get("points", 0),
-                                  "query": q, "title": title},
-                    ))
-            except Exception:
-                pass
-        _log(self.name, f"found {len(signals)} HN signals")
-        return signals
-
-
 # ---- 26-30. Industry-Specific Job Board Scrapers ----
-
-class _IndustryJobCollector(Collector):
-    source_type = "scrape"
-    schedule = "weekly"
-    tier = "B"
-    default_strength = 18.0
-
-    def _search_indeed_industry(self, industry_q: str, location: str) -> list[Signal]:
-        signals = []
-        q = quote_plus(industry_q)
-        loc = quote_plus(location)
-        resp = self._scrape_get(f"https://www.indeed.com/jobs?q={q}&l={loc}&sort=date&limit=15")
-        if not resp:
-            return signals
-        companies = re.findall(r'data-testid="company-name"[^>]*>([^<]+)<', resp.text)
-        if not companies:
-            companies = re.findall(r'"companyName"\s*:\s*"([^"]+)"', resp.text)
-        seen = set()
-        for co in companies:
-            co = co.strip()
-            if co and co not in seen:
-                seen.add(co)
-                signals.append(Signal(
-                    business_name=co,
-                    location=location,
-                    signal_type=f"hiring_{self.name}",
-                    strength=self.default_strength,
-                    source=self.name,
-                    raw_data={"industry_query": industry_q},
-                ))
-        return signals
-
-
-class HVACHiring(_IndustryJobCollector):
-    name = "hvac_hiring"
-    description = "HVAC companies hiring — boring cash-flow businesses that need capital to grow"
-
-    def collect(self, **kwargs) -> list[Signal]:
-        s = self._search_indeed_industry("HVAC technician", kwargs.get("location", "Minneapolis, MN"))
-        _log(self.name, f"found {len(s)} HVAC hiring signals")
-        return s
-
-
-class PlumbingHiring(_IndustryJobCollector):
-    name = "plumbing_hiring"
-    description = "Plumbing companies hiring — service businesses with strong recurring revenue"
-
-    def collect(self, **kwargs) -> list[Signal]:
-        s = self._search_indeed_industry("plumber", kwargs.get("location", "Minneapolis, MN"))
-        _log(self.name, f"found {len(s)} plumbing signals")
-        return s
-
-
-class ElectricalHiring(_IndustryJobCollector):
-    name = "electrical_hiring"
-    description = "Electrical contractors hiring"
-
-    def collect(self, **kwargs) -> list[Signal]:
-        s = self._search_indeed_industry("electrician", kwargs.get("location", "Minneapolis, MN"))
-        _log(self.name, f"found {len(s)} electrical signals")
-        return s
-
-
-class LandscapingHiring(_IndustryJobCollector):
-    name = "landscaping_hiring"
-    description = "Landscaping companies hiring — seasonal businesses that need bridge capital"
-
-    def collect(self, **kwargs) -> list[Signal]:
-        s = self._search_indeed_industry("landscaping crew", kwargs.get("location", "Minneapolis, MN"))
-        _log(self.name, f"found {len(s)} landscaping signals")
-        return s
-
-
-class TruckingHiring(_IndustryJobCollector):
-    name = "trucking_hiring"
-    description = "Trucking companies hiring drivers — capital-intensive, perfect MCA candidates"
-
-    def collect(self, **kwargs) -> list[Signal]:
-        s = self._search_indeed_industry("CDL driver", kwargs.get("location", "Minneapolis, MN"))
-        _log(self.name, f"found {len(s)} trucking signals")
-        return s
-
 
 # ---- 31. LoopNet Commercial Leases ----
 class LoopNetLeases(Collector):
@@ -1040,50 +983,6 @@ class LoopNetLeases(Collector):
     def collect(self, **kwargs) -> list[Signal]:
         _log(self.name, "LoopNet scraping requires headless browser — planned for v0.2")
         return []
-
-
-# ---- 32. Franchise Disclosure Documents ----
-class FranchiseDisclosures(Collector):
-    name = "franchise_disclosures"
-    description = "Franchise FDDs — new franchisees need startup capital"
-    source_type = "scrape"
-    schedule = "monthly"
-    market = "all"
-    tier = "B"
-    default_strength = 22.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        _log(self.name, "FDD scraping from state regulators — planned for v0.2")
-        return []
-
-
-# ---- 33. GoFundMe Business Campaigns ----
-class GoFundMeBusiness(Collector):
-    name = "gofundme_business"
-    description = "GoFundMe business campaigns — owners publicly seeking capital = direct intent"
-    source_type = "scrape"
-    schedule = "weekly"
-    tier = "B"
-    default_strength = 25.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        signals = []
-        location = kwargs.get("location", "Minneapolis")
-        resp = self._scrape_get(f"https://www.gofundme.com/discover/small-business-fundraiser?location={quote_plus(location)}")
-        if not resp:
-            return signals
-        titles = re.findall(r'"title"\s*:\s*"([^"]+)"', resp.text)
-        for t in titles[:15]:
-            if any(kw in t.lower() for kw in ["business", "shop", "store", "restaurant", "startup", "company"]):
-                signals.append(Signal(
-                    business_name=t.strip(),
-                    location=location,
-                    signal_type="crowdfunding_capital_need",
-                    strength=self.default_strength,
-                    source=self.name,
-                ))
-        _log(self.name, f"found {len(signals)} GoFundMe signals")
-        return signals
 
 
 # ---- 34. Kickstarter/Indiegogo ----
@@ -1143,39 +1042,6 @@ class GitHubActivity(Collector):
         # GitHub API is free, no key needed for public repos
         _log(self.name, "GitHub activity tracking requires a curated list of SaaS repos — enrichment collector")
         return []
-
-
-# ---- 37. Product Hunt Launches ----
-class ProductHuntLaunches(Collector):
-    name = "product_hunt"
-    description = "Recent Product Hunt launches — startups that just launched need growth capital"
-    source_type = "scrape"
-    schedule = "daily"
-    market = "rbf"
-    tier = "B"
-    default_strength = 20.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        signals = []
-        resp = self._scrape_get("https://www.producthunt.com/")
-        if not resp:
-            return signals
-        # Extract product names from the homepage
-        names = re.findall(r'"name"\s*:\s*"([^"]{3,60})"', resp.text)
-        seen = set()
-        for n in names[:20]:
-            n = n.strip()
-            if n and n not in seen and len(n) > 3:
-                seen.add(n)
-                signals.append(Signal(
-                    business_name=n,
-                    signal_type="product_launch",
-                    strength=self.default_strength,
-                    source=self.name,
-                    source_url="https://www.producthunt.com",
-                ))
-        _log(self.name, f"found {len(signals)} Product Hunt signals")
-        return signals
 
 
 # ---- 38. Acquire.com Listings (micro-acq) ----
@@ -1400,34 +1266,6 @@ class SSLCertExpiry(Collector):
         return []
 
 
-# ---- 53. Franchise Resale Listings ----
-class FranchiseResale(Collector):
-    name = "franchise_resale"
-    description = "Franchise resale listings — franchisee wants to exit"
-    source_type = "scrape"
-    schedule = "weekly"
-    market = "micro_acq"
-    tier = "B"
-    default_strength = 22.0
-
-    def collect(self, **kwargs) -> list[Signal]:
-        signals = []
-        resp = self._scrape_get("https://www.franchisegator.com/resales/")
-        if not resp:
-            return signals
-        titles = re.findall(r'<h[23][^>]*>([^<]+)</h[23]>', resp.text)
-        for t in titles[:15]:
-            if len(t.strip()) > 5:
-                signals.append(Signal(
-                    business_name=t.strip(),
-                    signal_type="franchise_resale",
-                    strength=self.default_strength,
-                    source=self.name,
-                ))
-        _log(self.name, f"found {len(signals)} franchise resale signals")
-        return signals
-
-
 # ---- 54. AngelList / Wellfound Startups ----
 class AngelListStartups(Collector):
     name = "angellist_startups"
@@ -1454,8 +1292,34 @@ class CountyCourtRecords(Collector):
     default_strength = 20.0
 
     def collect(self, **kwargs) -> list[Signal]:
-        _log(self.name, "County court records require per-county scraper — planned for v0.2")
-        return []
+        signals = []
+        url = "https://publicaccess.courts.state.mn.us/CaseSearch"
+        resp = self._scrape_get(url, render=True)
+        if not resp:
+            _log(self.name, f"Court records: search manually at {url} (automation blocked)")
+            return signals
+        text = getattr(resp, "text", "") or ""
+        # Look for business-like party names (contains LLC/Inc/Corp)
+        biz = re.findall(r'\b([A-Z][A-Za-z0-9&.,\' ]{3,45}(?:LLC|Inc|Corp|Co|Ltd|Company))\b', text)
+        seen = set()
+        for b in biz[:15]:
+            b = b.strip()
+            if b in seen:
+                continue
+            seen.add(b)
+            signals.append(Signal(
+                business_name=b,
+                location="MN",
+                signal_type="court_filing_business",
+                strength=self.default_strength,
+                source=self.name,
+                source_url=url,
+                urgency="litigation",
+                data_source_quality="scraped",
+                contact_availability="research_required",
+            ))
+        _log(self.name, f"found {len(signals)} court filing signals")
+        return signals
 
 
 # ---- 56. Hunter.io Email Finder ----
@@ -1816,40 +1680,26 @@ ALL_COLLECTORS: list[type[Collector]] = [
     OwnerHomeListing,          # 50
 
     # Tier B — Moderate
-    GooglePlacesChanges,       # 6
-    FoursquareActivity,        # 7 (replaces Yelp)
     MNSosNewBusinesses,        # 8
     WISosBusinesses,           # 10
     IASosBusinesses,           # 11
     OpenCorporatesSearch,      # 14
     BizBuySellListings,        # 15
     CraigslistBFS,             # 16
+    CraigslistJobs,            # 16b (hiring surge via Craigslist)
     USPTOTrademarks,           # 20
     BuildingPermits,           # 21
     LiquorLicenses,            # 23
-    HackerNewsSignals,         # 25 (replaces Reddit)
-    HVACHiring,                # 26
-    PlumbingHiring,            # 27
-    ElectricalHiring,          # 28
-    LandscapingHiring,         # 29
-    TruckingHiring,            # 30
     LoopNetLeases,             # 31
-    FranchiseDisclosures,      # 32
-    GoFundMeBusiness,          # 33
     ShopifyStoreDetector,      # 35
-    ProductHuntLaunches,       # 37
     AcquireComListings,        # 38
     EquipmentAuctions,         # 47
-    FranchiseResale,           # 53
     CountyCourtRecords,        # 55
 
     # Tier C — Contextual / enrichment
     NDSosBusinesses,           # 12
     SDSosBusinesses,           # 13
     GoogleTrends,              # 17
-    BBBAccredited,             # 18
-    WHOISDomainExpiry,         # 19
-    HealthInspections,         # 22
     KickstarterProjects,       # 34
     GitHubActivity,            # 36
     ILSosBusinesses,           # 39

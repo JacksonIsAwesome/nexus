@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 import collectors as signal_engine
 
 APP_NAME = "NEXUS Deal Intelligence Engine"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.6.0"
 
 # ---------------------------------------------------------------------------
 # Config
