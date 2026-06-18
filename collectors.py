@@ -16,6 +16,7 @@ import json
 import os
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -39,6 +40,25 @@ def _log(src: str, msg: str):
     print(f"[{_now().isoformat()[:19]}] [{src}] {msg}")
 
 
+class _ScrapeResult:
+    """
+    Lightweight stand-in for an httpx.Response so collectors that read `.text`
+    keep working when the page comes from Firecrawl (markdown + html).
+    Exposes .text (combined), .markdown, .html, and a no-op .json().
+    """
+    def __init__(self, text: str = "", markdown: str = "", html: str = "", status_code: int = 200):
+        self.text = text
+        self.markdown = markdown
+        self.html = html
+        self.status_code = status_code
+
+    def json(self):
+        try:
+            return json.loads(self.text)
+        except Exception:
+            return {}
+
+
 # ---------------------------------------------------------------------------
 # Signal data class
 # ---------------------------------------------------------------------------
@@ -55,11 +75,35 @@ class Signal:
     contact_hints: dict = field(default_factory=dict)  # phone, email, website, linkedin
     timestamp: datetime = field(default_factory=_now)
     dedup_key: str = ""                 # auto-generated if empty
+    # RBF/MCA deal-sourcing fields
+    revenue_estimate: str = ""          # "$50K-$100K/mo", "est. $2M/yr"
+    urgency: str = ""                   # growth | cashflow_gap | debt_refi | expansion
+    contact_availability: str = ""      # phone+email | linkedin_only | form_only | research_required
+    data_source_quality: str = ""       # public_record | api | scraped | estimated | stub
 
     def __post_init__(self):
         if not self.dedup_key:
             raw = f"{self.business_name}|{self.signal_type}|{self.source}".lower()
             self.dedup_key = hashlib.md5(raw.encode()).hexdigest()[:16]
+        # Auto-derive contact_availability from contact_hints if not set
+        if not self.contact_availability:
+            hints = self.contact_hints or {}
+            has_phone = bool(hints.get("phone"))
+            has_email = bool(hints.get("email"))
+            has_li = bool(hints.get("linkedin"))
+            has_web = bool(hints.get("website"))
+            if has_phone and has_email:
+                self.contact_availability = "phone+email"
+            elif has_phone:
+                self.contact_availability = "phone_only"
+            elif has_email:
+                self.contact_availability = "email_only"
+            elif has_li:
+                self.contact_availability = "linkedin_only"
+            elif has_web:
+                self.contact_availability = "website_only"
+            else:
+                self.contact_availability = "research_required"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -101,9 +145,70 @@ class Collector:
             _log(self.name, f"request failed: {e}")
             return None
 
-    def _scrape_get(self, url: str, headers: dict = None) -> httpx.Response | None:
-        """GET with scraping courtesy delay and browser-like headers."""
+    def _scrape_get(self, url: str, headers: dict = None, render: bool = False):
+        """
+        Fetch a page through the best available method:
+          1. Firecrawl (if FIRECRAWL_API_KEY set) — returns clean markdown + html,
+             handles JS rendering, proxies, and anti-bot automatically.
+          2. Scrape.do (if SCRAPEDO_API_KEY set) — proxy/anti-ban, returns html.
+          3. Direct request (fallback) — works only on unprotected sites.
+
+        Returns an object with a `.text` attribute (the page content) so existing
+        collectors keep working. With Firecrawl, `.text` is markdown+html combined
+        and `.markdown` holds clean markdown for easier parsing.
+        """
         time.sleep(SCRAPE_DELAY)
+
+        firecrawl_key = os.getenv("FIRECRAWL_API_KEY", "").strip()
+        scrapedo_key = os.getenv("SCRAPEDO_API_KEY", "").strip()
+
+        # ---- Option 1: Firecrawl ----
+        if firecrawl_key:
+            try:
+                body = {
+                    "url": url,
+                    "formats": ["markdown", "html"],
+                    "onlyMainContent": False,
+                    "location": {"country": "US", "languages": ["en-US"]},
+                    "timeout": 45000,
+                    "blockAds": True,
+                    "proxy": "auto",
+                }
+                if render:
+                    body["waitFor"] = 2500
+                with httpx.Client(timeout=60.0) as c:
+                    r = c.post("https://api.firecrawl.dev/v2/scrape",
+                               json=body,
+                               headers={"Authorization": f"Bearer {firecrawl_key}",
+                                        "Content-Type": "application/json"})
+                if r.status_code != 200:
+                    _log(self.name, f"firecrawl HTTP {r.status_code} for {url[:60]}")
+                    return None
+                data = (r.json() or {}).get("data", {})
+                md = data.get("markdown", "") or ""
+                html = data.get("html", "") or ""
+                return _ScrapeResult(text=(md + "\n" + html), markdown=md, html=html)
+            except Exception as e:
+                _log(self.name, f"firecrawl failed: {e}")
+                return None
+
+        # ---- Option 2: Scrape.do ----
+        if scrapedo_key:
+            try:
+                params = {"token": scrapedo_key, "url": url, "geoCode": "us"}
+                if render:
+                    params["render"] = "true"
+                with httpx.Client(timeout=HTTP_TIMEOUT * 3, follow_redirects=True) as c:
+                    resp = c.get("https://api.scrape.do", params=params)
+                if resp.status_code != 200:
+                    _log(self.name, f"scrape.do HTTP {resp.status_code} for {url[:60]}")
+                    return None
+                return resp
+            except Exception as e:
+                _log(self.name, f"scrape.do failed: {e}")
+                return None
+
+        # ---- Option 3: Direct (fallback) ----
         hdrs = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -388,9 +493,12 @@ class FoursquareActivity(Collector):
     default_strength = 20.0
 
     def collect(self, **kwargs) -> list[Signal]:
-        key = os.getenv("FOURSQUARE_API_KEY", "").strip()
+        key = os.getenv("FOURSQUARE_API_KEY", "").strip().strip('"').strip("'")
+        if key.lower().startswith("bearer "):
+            key = key[7:].strip()
         if not key:
             return []
+        _log(self.name, f"key len={len(key)} prefix={key[:6]}...")
         signals = []
         location = kwargs.get("location", "Minneapolis, MN")
         # Foursquare Places API v3 — free 1,000 req/hour
@@ -792,43 +900,46 @@ class LinkedInHiring(Collector):
         return signals
 
 
-# ---- 25. Reddit r/smallbusiness ----
-class RedditSmallBusiness(Collector):
-    name = "reddit_smallbusiness"
-    description = "Reddit posts from business owners asking about financing — direct intent signal"
+# ---- 25. Hacker News — Business / Funding Discussions ----
+class HackerNewsSignals(Collector):
+    name = "hacker_news"
+    description = "Hacker News discussions about funding, revenue, hiring — founders with capital needs"
     source_type = "api"
     schedule = "daily"
     tier = "B"
-    default_strength = 22.0
+    default_strength = 20.0
 
     def collect(self, **kwargs) -> list[Signal]:
         signals = []
-        subreddits = ["smallbusiness", "Entrepreneur", "ecommerce"]
-        keywords = ["working capital", "business loan", "cash flow", "need funding", "financing options", "MCA", "line of credit"]
-        for sub in subreddits:
-            resp = self._get(f"https://www.reddit.com/r/{sub}/search.json", params={
-                "q": " OR ".join(keywords[:3]), "sort": "new", "t": "week", "limit": 10,
-                "restrict_sr": "on",
-            }, headers={"User-Agent": "NexusBot/1.0 (business research tool)"})
+        # HN Algolia search API — completely free, no auth
+        queries = ["working capital", "revenue based financing", "small business loan",
+                   "cash flow", "hiring engineers", "growing revenue"]
+        for q in queries[:3]:
+            resp = self._get("https://hn.algolia.com/api/v1/search_by_date", params={
+                "query": q, "tags": "story", "numericFilters": "points>5",
+                "hitsPerPage": 8,
+            })
             if not resp:
                 continue
             try:
-                posts = resp.json().get("data", {}).get("children", [])
-                for post in posts:
-                    d = post.get("data", {})
-                    title = d.get("title", "")
-                    author = d.get("author", "")
+                for hit in (resp.json().get("hits") or []):
+                    title = hit.get("title", "")
+                    author = hit.get("author", "")
+                    url = hit.get("url", "") or f"https://news.ycombinator.com/item?id={hit.get('objectID','')}"
+                    if not title or len(title) < 8:
+                        continue
                     signals.append(Signal(
-                        business_name=f"Reddit user: {author}",
-                        signal_type="financing_inquiry",
+                        business_name=title[:80],
+                        signal_type="founder_capital_discussion",
                         strength=self.default_strength,
                         source=self.name,
-                        source_url=f"https://www.reddit.com{d.get('permalink', '')}",
-                        raw_data={"title": title[:200], "subreddit": sub, "score": d.get("score", 0)},
+                        source_url=url,
+                        raw_data={"author": author, "points": hit.get("points", 0),
+                                  "query": q, "title": title},
                     ))
             except Exception:
                 pass
-        _log(self.name, f"found {len(signals)} Reddit signals")
+        _log(self.name, f"found {len(signals)} HN signals")
         return signals
 
 
@@ -1502,7 +1613,9 @@ class FoursquareNewBusinesses(Collector):
     default_strength = 20.0
 
     def collect(self, **kwargs) -> list[Signal]:
-        key = os.getenv("FOURSQUARE_API_KEY", "").strip()
+        key = os.getenv("FOURSQUARE_API_KEY", "").strip().strip('"').strip("'")
+        if key.lower().startswith("bearer "):
+            key = key[7:].strip()
         if not key:
             return []
         signals = []
@@ -1714,7 +1827,7 @@ ALL_COLLECTORS: list[type[Collector]] = [
     USPTOTrademarks,           # 20
     BuildingPermits,           # 21
     LiquorLicenses,            # 23
-    RedditSmallBusiness,       # 25
+    HackerNewsSignals,         # 25 (replaces Reddit)
     HVACHiring,                # 26
     PlumbingHiring,            # 27
     ElectricalHiring,          # 28
@@ -1978,18 +2091,37 @@ _GARBAGE_NAMES = {
     "click here", "sign up", "free trial", "download", "subscribe", "follow",
     "loading", "error", "undefined", "null", "none", "test", "example",
     "untitled", "no title", "new post", "draft", "placeholder",
+    "sec", "commission", "united states", "department", "agency",
+    "amendment", "modification", "solicitation", "notice", "combined synopsis",
     "", " ",
 }
 
-# Minimum name length and word requirements
+# Government procurement codes / categories (not business names)
+_GOV_CODE_PATTERNS = [
+    r'^\d{2}--',           # FSC codes like "43--RING,WEARING"
+    r'^\d{4,6}\s',         # NAICS codes like "541330 Engineering"
+    r'^[A-Z]--',           # PSC letter codes
+    r'--\w+,\w+',          # Double-dash category patterns
+    r'^COMBINED SYNOPSIS',
+    r'^AMENDMENT\s',
+    r'^MODIFICATION\s',
+    r'^SOURCES\s+SOUGHT',
+    r'^JUSTIFICATION\s',
+    r'^SPECIAL\s+NOTICE',
+    r'^AWARD\s+NOTICE',
+    r'^INTENT\s+TO\s',
+    r'^PRE.?SOLICITATION',
+    r'^SOLICITATION\b',
+]
+
+# Minimum name length
 _MIN_NAME_LENGTH = 4
-_MIN_WORD_LENGTH = 2  # at least 2 words for most signal types
 
 
 def _is_valid_signal(sig: Signal) -> bool:
     """
-    Returns True if this signal looks like a real business lead.
-    Filters out generic product descriptions, spam, and parsing artifacts.
+    Returns True if this signal looks like a real, actionable business lead.
+    Filters out: procurement codes, public companies, generic names, spam, artifacts.
     """
     name = (sig.business_name or "").strip()
 
@@ -1998,12 +2130,29 @@ def _is_valid_signal(sig: Signal) -> bool:
         return False
 
     # Known garbage
-    if name.lower() in _GARBAGE_NAMES:
+    if name.lower().strip() in _GARBAGE_NAMES:
         return False
 
-    # All lowercase single word under 15 chars = probably a generic term, not a business
-    # (e.g. "video editing", "plumbing", "roofing")
     words = name.split()
+
+    # Government procurement codes (e.g. "43--RING,WEARING", "5340--HARDWARE")
+    for pat in _GOV_CODE_PATTERNS:
+        if re.match(pat, name, re.IGNORECASE):
+            return False
+
+    # All-caps names with commas = probably a procurement category, not a business
+    # "RING,WEARING" or "BOLT,MACHINE" patterns
+    if name.isupper() and "," in name and len(name) < 40:
+        return False
+
+    # All-caps with no lowercase at all and under 30 chars = probably a code or abbreviation
+    # Real business names have mixed case ("Acme Trucking") or are longer if all-caps
+    if name.isupper() and len(name) < 25 and not any(c.isdigit() for c in name):
+        # Allow common business suffixes
+        if not any(s in name for s in ["LLC", "INC", "CORP", "LTD", "CO", "SERVICES", "GROUP"]):
+            return False
+
+    # All lowercase single word under 15 chars = probably a generic term
     if len(words) == 1 and len(name) < 15 and name.islower():
         return False
 
@@ -2011,33 +2160,106 @@ def _is_valid_signal(sig: Signal) -> bool:
     if name.startswith(("{", "[", "<", "http", "www.", "/", "#")):
         return False
 
-    # All caps single short word = probably an acronym pulled from HTML, not a real name
+    # All caps single short word = probably an acronym from HTML
     if len(words) == 1 and name.isupper() and len(name) < 5:
         return False
 
     # Contains obvious non-business patterns
     lower = name.lower()
     spam_patterns = ["click here", "sign up", "free", "discount", "limited time",
-                     "act now", "subscribe", "unsubscribe", "cookie", "privacy policy"]
+                     "act now", "subscribe", "unsubscribe", "cookie", "privacy policy",
+                     "page not found", "access denied", "error 404", "javascript"]
     if any(p in lower for p in spam_patterns):
         return False
 
-    # For Product Hunt signals specifically, require at least 2 words or a capital letter
-    # (filters out single-word generic tool names)
+    # Looks like a government solicitation title, not a business name
+    gov_title_words = ["solicitation", "amendment", "modification", "combined synopsis",
+                       "sources sought", "justification", "presolicitation",
+                       "request for proposal", "request for quote", "rfp", "rfq",
+                       "task order", "delivery order", "blanket purchase"]
+    if any(g in lower for g in gov_title_words):
+        return False
+
+    # Product Hunt: require 2+ words or internal capital
     if sig.source == "product_hunt":
         if len(words) < 2 and not any(c.isupper() for c in name[1:]):
             return False
 
-    # For SEC signals, filter out obviously-non-business entries
+    # SEC EDGAR: these are PUBLIC companies — mark but allow through with lower priority
+    # (the scoring will handle deprioritization)
     if sig.source == "sec_edgar_filings":
-        if len(name) < 5 or name.lower() in {"sec", "commission", "united states", "department"}:
+        if len(name) < 5:
+            return False
+        # Let them through but they'll be deprioritized in scoring
+
+    # SAM.gov: filter out solicitation TITLES (we want awardee NAMES)
+    if sig.source == "sam_gov_contracts":
+        raw = sig.raw_data or {}
+        # If the "business_name" looks like a solicitation title not a company name, reject
+        if len(name) > 60:
+            return False  # real company names are rarely this long
+        if any(w in lower for w in ["contract", "acquisition", "procurement", "maintenance of"]):
             return False
 
-    # Seasonal/internal signals always pass (they're hand-curated)
+    # Seasonal/internal signals always pass
     if sig.source in ("seasonal_calendar",):
         return True
 
     return True
+
+
+def _is_likely_public_company(sig: Signal) -> bool:
+    """
+    Detect if a signal is likely a public company (not our target market).
+    Public companies have SEC filings, are usually large, and don't need MCA.
+    """
+    if sig.source == "sec_edgar_filings":
+        return True
+
+    raw = sig.raw_data or {}
+    name = (sig.business_name or "").lower()
+
+    # Common public company indicators
+    public_suffixes = ["inc.", "incorporated", "corporation", "plc", "n.v."]
+    if any(s in name for s in public_suffixes):
+        return True
+
+    # If we know they have SEC filings from other data
+    if raw.get("form_type") in ("10-K", "10-Q", "8-K", "S-1"):
+        return True
+
+    return False
+
+
+def dedupe_and_stack(signals: list[Signal]) -> list[Signal]:
+    """
+    Merge signals about the same business+type. When a business shows up across
+    multiple sources, that's a STRONGER lead — stack them and boost strength.
+    """
+    buckets: dict[str, list[Signal]] = defaultdict(list)
+    for s in signals:
+        # Stack by business name (normalized), not just dedup_key, so cross-source
+        # signals on the same business merge
+        key = (s.business_name or "").lower().strip()
+        buckets[key].append(s)
+
+    merged = []
+    for key, group in buckets.items():
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        # Keep the strongest as base, stack the rest
+        base = max(group, key=lambda x: x.strength)
+        sources = sorted(set(s.source for s in group))
+        base.raw_data = dict(base.raw_data or {})
+        base.raw_data["stacked_sources"] = sources
+        base.raw_data["stack_count"] = len(group)
+        # Each additional distinct source adds strength (capped)
+        base.strength = min(base.strength + (len(sources) - 1) * 6, 100)
+        if len(sources) > 1 and not base.signal_type.startswith("stacked_"):
+            base.signal_type = f"stacked_{base.signal_type}"
+        merged.append(base)
+    return merged
 
 
 def rank_signals(signals: list[Signal], known_businesses: set[str] = None,
@@ -2098,7 +2320,7 @@ def registry_stats() -> dict:
     collectors = build_registry()
     total = len(collectors)
     enabled = sum(1 for c in collectors if c.enabled)
-    by_tier = {"A": 0, "B": 0, "C": 0}
+    by_tier = {"A": 0, "B": 0, "C": 0, "D": 0}
     by_market = {}
     by_type = {}
     for c in collectors:
@@ -2107,11 +2329,13 @@ def registry_stats() -> dict:
         by_type[c.source_type] = by_type.get(c.source_type, 0) + 1
     return {
         "total_collectors": total,
+        "total": total,
         "enabled": enabled,
+        "active_collectors": enabled,
         "disabled_missing_key": total - enabled,
         "by_tier": by_tier,
-        "by_market": by_market,
         "by_source_type": by_type,
+        "by_market": by_market,
         "collectors": [c.status() for c in collectors],
     }
 

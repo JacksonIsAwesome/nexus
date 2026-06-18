@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 import collectors as signal_engine
 
 APP_NAME = "NEXUS Deal Intelligence Engine"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.1"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -418,6 +418,7 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 @app.get("/api/health")
 def health():
+    _stats = signal_engine.registry_stats()
     return {
         "status": "ok", "app": APP_NAME, "version": APP_VERSION,
         "time": _now().isoformat(),
@@ -426,9 +427,16 @@ def health():
             "claude": bool(ANTHROPIC_API_KEY),
             "sam_gov": bool(os.getenv("SAM_GOV_API_KEY", "").strip()),
             "google_maps": bool(os.getenv("GOOGLE_MAPS_API_KEY", "").strip()),
-            "yelp": bool(os.getenv("YELP_API_KEY", "").strip()),
+            "foursquare": bool(os.getenv("FOURSQUARE_API_KEY", "").strip()),
+            "firecrawl": bool(os.getenv("FIRECRAWL_API_KEY", "").strip()),
+            "scrapedo": bool(os.getenv("SCRAPEDO_API_KEY", "").strip()),
         },
-        "signal_collectors": signal_engine.registry_stats()["total_collectors"],
+        "signal_collectors": {
+            "total": _stats["total"],
+            "active": _stats["active_collectors"],
+            "by_tier": _stats["by_tier"],
+            "by_source_type": _stats["by_source_type"],
+        },
     }
 
 
@@ -897,7 +905,19 @@ def run_signals(payload: RunSignalsInput, db: Session = Depends(get_db)):
     all_signals = []
     errors = []
     ran = []
-    kwargs = {"states": payload.states, "cities": payload.cities, "location": payload.location}
+    # Use config regions as defaults, allow payload override
+    try:
+        import config as nexus_config
+        default_states = nexus_config.TARGET_STATES
+        default_cities = nexus_config.cities_as_list()
+    except Exception:
+        default_states = ["MN"]
+        default_cities = ["Minneapolis, MN", "St Paul, MN"]
+    kwargs = {
+        "states": payload.states or default_states,
+        "cities": payload.cities or default_cities,
+        "location": payload.location or (default_cities[0] if default_cities else "Minneapolis, MN"),
+    }
     for c in registry:
         if not c.enabled:
             continue
@@ -907,6 +927,11 @@ def run_signals(payload: RunSignalsInput, db: Session = Depends(get_db)):
             ran.append(c.name)
         except Exception as e:
             errors.append(f"{c.name}: {e}")
+
+    # Dedupe + stack cross-source signals (same business from multiple sources = hotter)
+    pre_stack = len(all_signals)
+    all_signals = signal_engine.dedupe_and_stack(all_signals)
+    stacked = pre_stack - len(all_signals)
 
     # Score and rank
     known = {d.business_name.lower() for d in db.execute(select(Deal)).scalars().all()}
@@ -932,7 +957,9 @@ def run_signals(payload: RunSignalsInput, db: Session = Depends(get_db)):
 
     return {
         "collectors_run": len(ran),
-        "signals_found": len(all_signals),
+        "signals_found": pre_stack,
+        "after_stacking": len(all_signals),
+        "stacked_merged": stacked,
         "unique_businesses": len(ranked),
         "new_signals_stored": stored,
         "errors": errors,
